@@ -1,17 +1,23 @@
-"""Minimal MCP client over streamable HTTP.
+"""MCP client for Ian's durable MCP server.
 
-Deliberately stateless: one HTTP round trip per call, no long-lived session.
-Temporal activities are independent and retryable, so a session object that
-had to survive across attempts would be a liability, not a feature.
+Written against the contract in `temporal-agntcon-devnotes/notes-for-melissa.md`
+and verified against the live server. Four things here are load-bearing; each
+one is silent in rehearsal and fatal the moment the audience breaks something.
 
-THE IMPORTANT PART OF THIS FILE is `_classify`. Everything the demo claims
-rests on drawing one line correctly:
+1. `MCP-Protocol-Version: 2026-07-28`. Omit it and the server routes us to the
+   legacy transport, which has no SSE keepalive — the call then dies at ~5 min
+   behind Railway's proxy, mid-outage.
+2. `params._meta` carrying the two `io.modelcontextprotocol/*` envelope keys.
+   Required on EVERY request, tools/list included. Without them: instant -32602
+   and no workflow starts.
+3. The response is JSON *or* SSE. Any call running silent past ~15s upgrades to
+   `text/event-stream` with `: ping` comments. A JSON-only parser works right up
+   until a service is held down, which is the entire demo.
+4. Timeouts above 15 minutes. The server's own wait cap is 840s.
 
-    infrastructure failure  -> raise  -> Temporal retries, model never re-asked
-    business outcome        -> return -> model sees it and re-plans
-
-Get that backwards and the agent retries "out of stock" forever while the
-token counter climbs, which is the exact opposite of the point.
+One thing NOT to build: error states for "service is down". Ian's server absorbs
+those and retries internally, so a broken service is a slow call, never a failed
+one. Every call eventually returns `completed: true`.
 """
 
 from __future__ import annotations
@@ -21,154 +27,224 @@ from typing import Any
 
 import httpx
 
-from .shared import ToolSpec
+from .shared import ToolResult, ToolSpec
+
+PROTOCOL_VERSION = "2026-07-28"
+
+# The envelope every request must carry inside params._meta.
+_ENVELOPE: dict[str, Any] = {
+    "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
+    "io.modelcontextprotocol/clientCapabilities": {},
+}
 
 
 class McpInfrastructureError(Exception):
-    """Something is broken. Retryable — Temporal will try again."""
+    """Transport-level breakage. Retryable — Temporal will try again.
+
+    Note this is NOT "a downstream service is down"; the server hides that from
+    us. This is the MCP server itself being unreachable, or our stream severed.
+    """
 
 
 class McpProtocolError(Exception):
-    """The server answered, but nonsensically. Not worth retrying."""
+    """The server answered, but we got the request wrong. Retrying won't help."""
 
 
-JSONRPC = "2.0"
+def _headers(token: str, method: str, tool_name: str | None = None) -> dict[str, str]:
+    headers = {
+        "MCP-Protocol-Version": PROTOCOL_VERSION,
+        "Mcp-Method": method,
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if tool_name:
+        headers["Mcp-Name"] = tool_name
+    return headers
 
 
-def _rpc(method: str, params: dict[str, Any] | None = None, req_id: int = 1) -> dict:
-    body: dict[str, Any] = {"jsonrpc": JSONRPC, "id": req_id, "method": method}
-    if params is not None:
-        body["params"] = params
-    return body
+def _timeout(read_seconds: float) -> httpx.Timeout:
+    # Generous read, tight connect: a server we can't reach should fail fast so
+    # Temporal retries, while a server that's working hard gets all the time it
+    # needs.
+    return httpx.Timeout(connect=10.0, read=read_seconds, write=30.0, pool=10.0)
 
 
-def _classify(response: httpx.Response) -> dict:
-    """Turn an HTTP response into a JSON-RPC result, or raise the right error type."""
-    # 5xx and 429 are the classic "try again in a moment" cases.
-    if response.status_code >= 500 or response.status_code == 429:
-        raise McpInfrastructureError(
-            f"MCP server returned {response.status_code} — retryable"
-        )
-    # 4xx (bad tool name, malformed args) will not fix itself on retry.
-    if response.status_code >= 400:
-        raise McpProtocolError(
-            f"MCP server returned {response.status_code}: {response.text[:200]}"
-        )
+async def _parse_sse(response: httpx.Response) -> dict:
+    """Pull the first JSON-RPC message out of an SSE stream.
+
+    Skips `: ping` keepalive comments and accumulates multi-line `data:` fields
+    per the SSE spec rather than assuming one line per event.
+    """
+    buffer: list[str] = []
+
+    async for line in response.aiter_lines():
+        line = line.rstrip("\r")
+
+        if line.startswith(":"):          # keepalive comment — the whole point
+            continue
+        if line.startswith("data:"):
+            buffer.append(line[5:].lstrip())
+            continue
+        if line == "" and buffer:         # blank line ends the event
+            break
+        # event:, id:, retry: — irrelevant to us
+
+    if not buffer:
+        raise McpInfrastructureError("SSE stream ended before any data arrived")
 
     try:
-        payload = response.json()
+        return json.loads("\n".join(buffer))
     except json.JSONDecodeError as exc:
-        raise McpProtocolError(f"MCP server returned non-JSON: {exc}") from exc
+        raise McpProtocolError(f"SSE data was not JSON: {exc}") from exc
 
-    # A JSON-RPC *error* object is a protocol-level failure — the request never
-    # reached the tool. Distinct from a tool that ran and reported bad news.
+
+async def _rpc(
+    endpoint: str,
+    token: str,
+    method: str,
+    params: dict[str, Any],
+    read_seconds: float,
+    tool_name: str | None = None,
+) -> dict:
+    """One JSON-RPC round trip, handling both response encodings."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        # Merge rather than overwrite: callers add idempotencyKey alongside.
+        "params": {**params, "_meta": {**_ENVELOPE, **(params.get("_meta") or {})}},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=_timeout(read_seconds)) as client:
+            async with client.stream(
+                "POST", endpoint, json=body, headers=_headers(token, method, tool_name)
+            ) as response:
+                if response.status_code >= 500 or response.status_code == 429:
+                    await response.aread()
+                    raise McpInfrastructureError(
+                        f"MCP server returned {response.status_code} — retryable"
+                    )
+                if response.status_code == 401:
+                    await response.aread()
+                    raise McpProtocolError(
+                        "MCP server rejected our agent token (401) — check MCP_AUTH_TOKEN"
+                    )
+                if response.status_code >= 400:
+                    await response.aread()
+                    raise McpProtocolError(
+                        f"MCP server returned {response.status_code}: {response.text[:300]}"
+                    )
+
+                content_type = response.headers.get("content-type", "")
+                if "text/event-stream" in content_type:
+                    payload = await _parse_sse(response)
+                else:
+                    raw = await response.aread()
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise McpProtocolError(f"non-JSON response: {exc}") from exc
+
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        raise McpInfrastructureError(f"cannot reach MCP server: {exc}") from exc
+    except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+        # A severed stream mid-call. Retrying is correct AND safe, because the
+        # idempotency key attaches the retry to the original workflow instead of
+        # placing a second order.
+        raise McpInfrastructureError(f"stream to MCP server failed: {exc}") from exc
+    except httpx.HTTPError as exc:
+        raise McpInfrastructureError(f"transport failure: {exc}") from exc
+
     if "error" in payload:
         err = payload["error"] or {}
-        raise McpProtocolError(f"JSON-RPC error {err.get('code')}: {err.get('message')}")
-
+        raise McpProtocolError(f"JSON-RPC {err.get('code')}: {err.get('message')}")
     if "result" not in payload:
-        raise McpProtocolError("JSON-RPC response had neither result nor error")
+        raise McpProtocolError("response carried neither result nor error")
 
     return payload["result"]
 
 
-async def _post(
-    client: httpx.AsyncClient,
-    endpoint: str,
-    body: dict,
-    headers: dict[str, str] | None = None,
-) -> dict:
-    try:
-        response = await client.post(endpoint, json=body, headers=headers or {})
-    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        # The audience unplugged the cable. Textbook retryable.
-        raise McpInfrastructureError(f"cannot reach MCP server: {exc}") from exc
-    except httpx.ReadTimeout as exc:
-        raise McpInfrastructureError(f"MCP server timed out: {exc}") from exc
-    except httpx.HTTPError as exc:
-        raise McpInfrastructureError(f"transport failure: {exc}") from exc
-    return _classify(response)
+async def list_tools(endpoint: str, token: str, read_seconds: float = 30.0) -> list[ToolSpec]:
+    """Discover what the server exposes.
 
-
-async def list_tools(endpoint: str, timeout: float = 20.0) -> list[ToolSpec]:
-    """Ask the server what Richard sells today.
-
-    Discovered at runtime on purpose — the tool names live in the MCP server's
-    env vars, so hardcoding them here would break the moment they're retuned.
+    Never hardcode the tool list: the names come from Ian's Railway env vars and
+    have already changed once (order_coffee -> order_churro).
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        result = await _post(client, endpoint, _rpc("tools/list"))
+    result = await _rpc(endpoint, token, "tools/list", {}, read_seconds)
 
     tools = result.get("tools")
     if not isinstance(tools, list):
         raise McpProtocolError("tools/list did not return a list of tools")
 
-    specs: list[ToolSpec] = []
-    for tool in tools:
-        specs.append(
-            ToolSpec(
-                name=tool["name"],
-                description=tool.get("description", ""),
-                input_schema=tool.get("inputSchema") or tool.get("input_schema") or {},
-            )
+    return [
+        ToolSpec(
+            name=tool["name"],
+            description=tool.get("description", ""),
+            input_schema=tool.get("inputSchema") or {"type": "object", "properties": {}},
         )
-    return specs
+        for tool in tools
+    ]
 
 
 async def call_tool(
     endpoint: str,
+    token: str,
     name: str,
     arguments: dict[str, Any],
     idempotency_key: str,
-    timeout: float = 120.0,
-) -> tuple[str, bool, bool]:
-    """Call one tool. Returns (content, is_error, deduplicated).
+    read_seconds: float = 960.0,
+) -> ToolResult:
+    """Call one tool and block until the work is genuinely done.
 
-    Returning rather than raising on `isError` is the whole contract: an MCP
-    tool result that says "out of stock" is a successful activity carrying bad
-    news, and the model is the one that should decide what to do about it.
+    May take minutes. That is not a bug — it is the server retrying a broken
+    downstream on our behalf, and `attempts` is roughly how many seconds the
+    outage lasted.
     """
-    body = _rpc(
+    result = await _rpc(
+        endpoint,
+        token,
         "tools/call",
         {
             "name": name,
             "arguments": arguments,
-            # Idempotency key travels two ways so the server can read it
-            # whichever way is convenient — as an MCP _meta field...
             "_meta": {"idempotencyKey": idempotency_key},
         },
+        read_seconds,
+        tool_name=name,
     )
-    # ...and as a plain header, which is easier to reach in a FastAPI handler.
-    headers = {"Idempotency-Key": idempotency_key}
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        result = await _post(client, endpoint, body, headers)
+    structured = result.get("structuredContent") or {}
 
-    content = _flatten_content(result.get("content", []))
-    is_error = bool(result.get("isError", False))
-
-    # Non-standard, agreed with the MCP server: tells us a retried call
-    # attached to an existing workflow instead of running a second time.
-    meta = result.get("_meta") or {}
-    deduplicated = bool(meta.get("deduplicated", False))
-
-    return content, is_error, deduplicated
+    return ToolResult(
+        content=_readable(name, structured, result),
+        is_error=bool(result.get("isError", False)),
+        attempts=int(structured.get("attempts", 0) or 0),
+        workflow_id=str(structured.get("workflow_id", "") or ""),
+        deduplicated=bool((result.get("_meta") or {}).get("deduplicated", False)),
+    )
 
 
-def _flatten_content(blocks: Any) -> str:
-    """MCP content is a list of typed blocks; the model wants a string."""
-    if isinstance(blocks, str):
-        return blocks
-    if not isinstance(blocks, list):
-        return json.dumps(blocks)
+def _readable(name: str, structured: dict, result: dict) -> str:
+    """What the model sees.
 
+    Deliberately hides `attempts` and `workflow_id` — how hard the server had to
+    work is the dashboard's business, not the agent's. Telling the model a call
+    took 143 attempts invites it to "handle" a problem that is already solved.
+    """
+    if structured:
+        if structured.get("completed"):
+            payload = structured.get("response")
+            detail = f" {json.dumps(payload)}" if payload else ""
+            return f"{name} completed.{detail}"
+        return f"{name} did not complete: {json.dumps(structured)[:400]}"
+
+    blocks = result.get("content") or []
     parts: list[str] = []
     for block in blocks:
-        if isinstance(block, str):
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        elif isinstance(block, str):
             parts.append(block)
-        elif isinstance(block, dict):
-            if block.get("type") == "text":
-                parts.append(block.get("text", ""))
-            else:
-                parts.append(json.dumps(block))
-    return "\n".join(p for p in parts if p) or "(empty result)"
+    return "\n".join(p for p in parts if p) or f"{name} returned no content."

@@ -1,22 +1,32 @@
-"""Live check of the MCP client against the fake server, over real HTTP.
+"""Contract tests for the MCP client, against the local stand-in over real HTTP.
 
-Verifies the one thing the whole demo rests on: that a business outcome and
-an infrastructure failure come back as different *kinds* of thing.
+These exist because of the four traps in Ian's notes, each of which is silent in
+rehearsal and fatal once the audience holds a service down. The SSE test is the
+important one: a JSON-only parser passes every other test in this file.
 """
 
 from __future__ import annotations
 
-import asyncio
+import os
 import socket
 import threading
 import time
 
 import httpx
 import pytest
-import uvicorn
 
-from fake_mcp.server import app
-from richards_agent import mcp_client
+# Set before the server module reads them: keep the retry loop and the SSE
+# upgrade fast enough to test.
+os.environ["FAKE_ATTEMPT_INTERVAL"] = "0.05"
+os.environ["FAKE_SSE_AFTER"] = "0.1"
+os.environ["FAKE_RESTART_SECONDS"] = "1.0"
+
+import uvicorn  # noqa: E402
+
+from fake_mcp.server import app  # noqa: E402
+from richards_agent import mcp_client  # noqa: E402
+
+TOKEN = "test-token"
 
 
 def _free_port() -> int:
@@ -26,24 +36,22 @@ def _free_port() -> int:
 
 
 @pytest.fixture(scope="module")
-def server() -> str:
+def base() -> str:
     port = _free_port()
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
-    srv = uvicorn.Server(config)
-    thread = threading.Thread(target=srv.run, daemon=True)
-    thread.start()
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    threading.Thread(target=srv.run, daemon=True).start()
 
-    base = f"http://127.0.0.1:{port}"
+    url = f"http://127.0.0.1:{port}"
     for _ in range(100):
         try:
-            httpx.get(f"{base}/chaos", timeout=0.5)
+            httpx.get(f"{url}/healthz", timeout=0.5)
             break
-        except Exception:  # noqa: BLE001 - server still booting
+        except Exception:  # noqa: BLE001 - still booting
             time.sleep(0.05)
     else:
         pytest.fail("fake MCP server did not start")
 
-    yield base
+    yield url
     srv.should_exit = True
 
 
@@ -51,103 +59,168 @@ def _reset(base: str) -> None:
     httpx.post(f"{base}/reset", timeout=5)
 
 
+def _set(base: str, component: str, action: str) -> None:
+    httpx.post(f"{base}/chaos/{component}/{action}", timeout=5)
+
+
+# ---------------------------------------------------------------- discovery
 @pytest.mark.asyncio
-async def test_tools_are_discovered_at_runtime(server: str):
-    _reset(server)
-    tools = await mcp_client.list_tools(f"{server}/mcp")
+async def test_tools_are_discovered_not_hardcoded(base: str):
+    _reset(base)
+    tools = await mcp_client.list_tools(f"{base}/mcp", TOKEN)
     names = [t.name for t in tools]
-    assert "order_a_taco" in names
-    assert "take_payment" in names
-    # Schemas come from the server, not from us.
-    assert all(t.input_schema.get("type") == "object" for t in tools)
+
+    assert "order_taco" in names
+    assert len(tools) == 4
+    # Zero-argument by design — every tool takes {}.
+    assert all(t.input_schema.get("properties") == {} for t in tools)
+    # Descriptions matter: the model picks tools from them.
+    assert all(t.description for t in tools)
 
 
 @pytest.mark.asyncio
-async def test_out_of_stock_returns_it_does_not_raise(server: str):
-    """Business outcome: the call SUCCEEDS and carries bad news."""
-    _reset(server)
-    content, is_error, _ = await mcp_client.call_tool(
-        f"{server}/mcp", "order_a_taco", {"item": "chicken taco", "quantity": 12}, "k1"
-    )
-    assert is_error is True
-    assert "OUT_OF_STOCK" in content
+async def test_envelope_is_sent_on_every_request(base: str):
+    """list_tools must carry params._meta or the real server answers -32602.
 
-
-@pytest.mark.asyncio
-async def test_server_down_raises_retryable(server: str):
-    """Infrastructure failure: the call RAISES, so Temporal retries it."""
-    _reset(server)
-    httpx.post(f"{server}/chaos/mcp_worker/down", timeout=5)
-    try:
-        with pytest.raises(mcp_client.McpInfrastructureError):
-            await mcp_client.call_tool(
-                f"{server}/mcp", "get_specials", {}, "k2"
-            )
-    finally:
-        httpx.post(f"{server}/chaos/mcp_worker/up", timeout=5)
-
-
-@pytest.mark.asyncio
-async def test_unreachable_server_raises_retryable():
-    """Nothing listening at all — still retryable, not a crash."""
-    with pytest.raises(mcp_client.McpInfrastructureError):
-        await mcp_client.list_tools("http://127.0.0.1:1/mcp", timeout=2.0)
-
-
-@pytest.mark.asyncio
-async def test_same_key_dedupes_the_charge(server: str):
-    """Two calls, same idempotency key, one charge."""
-    _reset(server)
-    first_content, _, first_dedup = await mcp_client.call_tool(
-        f"{server}/mcp", "take_payment", {"order_id": "4471", "amount": 14.20}, "pay-1"
-    )
-    second_content, _, second_dedup = await mcp_client.call_tool(
-        f"{server}/mcp", "take_payment", {"order_id": "4471", "amount": 14.20}, "pay-1"
-    )
-
-    assert first_dedup is False
-    assert second_dedup is True
-    assert first_content == second_content
-
-    state = httpx.get(f"{server}/state", timeout=5).json()
-    assert list(state["payments"].keys()) == ["4471"]
-
-
-@pytest.mark.asyncio
-async def test_different_keys_are_two_charges(server: str):
-    """Sanity check on the other side: dedup must not be over-eager."""
-    _reset(server)
-    _, _, d1 = await mcp_client.call_tool(
-        f"{server}/mcp", "take_payment", {"order_id": "a", "amount": 1}, "pay-a"
-    )
-    _, _, d2 = await mcp_client.call_tool(
-        f"{server}/mcp", "take_payment", {"order_id": "b", "amount": 2}, "pay-b"
-    )
-    assert (d1, d2) == (False, False)
-    state = httpx.get(f"{server}/state", timeout=5).json()
-    assert sorted(state["payments"].keys()) == ["a", "b"]
-
-
-@pytest.mark.asyncio
-async def test_business_error_is_not_cached_by_idempotency(server: str):
-    """A retry after restocking must be allowed to succeed.
-
-    Caching the out-of-stock result under its key would permanently wedge the
-    order — the agent restocks, tries again, and gets the stale failure back.
+    Verified against the live server: the envelope is required on tools/list,
+    not just tools/call.
     """
-    _reset(server)
-    _, is_error, _ = await mcp_client.call_tool(
-        f"{server}/mcp", "order_a_taco", {"item": "taco", "quantity": 12}, "same-key"
-    )
-    assert is_error is True
+    _reset(base)
+    # Raw request WITHOUT the envelope — should be rejected.
+    raw = httpx.post(
+        f"{base}/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=5,
+    ).json()
+    assert raw["error"]["code"] == -32602
 
-    await mcp_client.call_tool(
-        f"{server}/mcp", "order_more_inventory", {"ingredient": "chicken", "pounds": 40}, "restock"
+    # Our client sends it, so it works.
+    assert await mcp_client.list_tools(f"{base}/mcp", TOKEN)
+
+
+# ---------------------------------------------------------------- the big one
+@pytest.mark.asyncio
+async def test_broken_service_is_slow_not_failed_and_comes_back_over_sse(base: str):
+    """The behaviour the whole demo rests on.
+
+    A downed service does not produce an error. The call blocks, the transport
+    upgrades to text/event-stream with ping comments, and the result arrives
+    once the service is repaired. `attempts` counts the retries.
+    """
+    _reset(base)
+    _set(base, "service_1", "down")
+
+    async def repair_shortly() -> None:
+        import asyncio
+        await asyncio.sleep(0.6)
+        _set(base, "service_1", "up")
+
+    import asyncio
+    repair = asyncio.create_task(repair_shortly())
+
+    result = await mcp_client.call_tool(
+        f"{base}/mcp", TOKEN, "order_taco", {}, "key-sse-1", read_seconds=30
+    )
+    await repair
+
+    assert result.is_error is False
+    assert "completed" in result.content
+    assert result.attempts > 1, "should have retried while the service was down"
+    assert result.workflow_id.startswith("order_taco-")
+
+
+@pytest.mark.asyncio
+async def test_fast_call_returns_plain_json(base: str):
+    """The other encoding. Both paths have to work in one client."""
+    _reset(base)
+    result = await mcp_client.call_tool(
+        f"{base}/mcp", TOKEN, "order_taco", {}, "key-fast-1", read_seconds=30
+    )
+    assert result.is_error is False
+    assert result.attempts == 1
+
+
+# ---------------------------------------------------------------- auth
+@pytest.mark.asyncio
+async def test_bad_token_is_terminal_not_retried(base: str):
+    """A wrong token will never come right by retrying — fail fast and say so."""
+    _reset(base)
+    os.environ["FAKE_AGENT_TOKEN"] = TOKEN
+    import fake_mcp.server as server
+    server.AGENT_TOKEN = TOKEN
+    try:
+        with pytest.raises(mcp_client.McpProtocolError, match="token"):
+            await mcp_client.list_tools(f"{base}/mcp", "wrong-token")
+    finally:
+        server.AGENT_TOKEN = ""
+        os.environ.pop("FAKE_AGENT_TOKEN", None)
+
+
+@pytest.mark.asyncio
+async def test_unreachable_server_is_retryable():
+    """Nothing listening: Temporal's problem, and it should retry."""
+    with pytest.raises(mcp_client.McpInfrastructureError):
+        await mcp_client.list_tools("http://127.0.0.1:1/mcp", TOKEN, read_seconds=2)
+
+
+# ---------------------------------------------------------------- idempotency
+@pytest.mark.asyncio
+async def test_same_key_attaches_instead_of_ordering_twice(base: str):
+    _reset(base)
+    first = await mcp_client.call_tool(
+        f"{base}/mcp", TOKEN, "send_receipt", {}, "receipt-1", read_seconds=30
+    )
+    second = await mcp_client.call_tool(
+        f"{base}/mcp", TOKEN, "send_receipt", {}, "receipt-1", read_seconds=30
     )
 
-    content, is_error, dedup = await mcp_client.call_tool(
-        f"{server}/mcp", "order_a_taco", {"item": "taco", "quantity": 12}, "same-key"
+    assert first.deduplicated is False
+    assert second.deduplicated is True
+    assert second.workflow_id == first.workflow_id
+
+    ledger = httpx.get(f"{base}/ledger", timeout=5).json()
+    assert ledger["fulfilled"] == 1, "a retry must not fulfil a second order"
+
+
+@pytest.mark.asyncio
+async def test_different_keys_are_two_orders(base: str):
+    """Dedup must not be over-eager in the other direction."""
+    _reset(base)
+    a = await mcp_client.call_tool(
+        f"{base}/mcp", TOKEN, "order_taco", {}, "taco-a", read_seconds=30
     )
-    assert is_error is False, content
-    assert dedup is False
-    assert "placed" in content
+    b = await mcp_client.call_tool(
+        f"{base}/mcp", TOKEN, "order_taco", {}, "taco-b", read_seconds=30
+    )
+    assert (a.deduplicated, b.deduplicated) == (False, False)
+    assert a.workflow_id != b.workflow_id
+
+    ledger = httpx.get(f"{base}/ledger", timeout=5).json()
+    assert ledger["fulfilled"] == 2
+
+
+# ---------------------------------------------------------------- the gap
+@pytest.mark.asyncio
+async def test_ledger_gap_tracks_orders_stuck_in_retry(base: str):
+    """`ordered - fulfilled` is Ian's recommended headline number: how many
+    orders are mid-retry right now. It should spike while broken."""
+    _reset(base)
+    _set(base, "service_3", "down")
+
+    import asyncio
+    call = asyncio.create_task(
+        mcp_client.call_tool(
+            f"{base}/mcp", TOKEN, "restock_inventory", {}, "gap-1", read_seconds=30
+        )
+    )
+    await asyncio.sleep(0.4)
+
+    mid = httpx.get(f"{base}/ledger", timeout=5).json()
+    assert mid["gap"] == 1, "one order should be stuck in retry"
+
+    _set(base, "service_3", "up")
+    await call
+
+    after = httpx.get(f"{base}/ledger", timeout=5).json()
+    assert after["gap"] == 0, "gap should drain to zero once repaired"

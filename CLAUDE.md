@@ -5,12 +5,9 @@ MCP Systems"** demo — AgntCon / MCPCon North America, October 2026.
 
 ## What this demo is
 
-The audience sabotages a live taco order from their phones while Temporal keeps
-resuming it. A taco-ordering agent talks to Richard's MCP server; the agent, the
-MCP server, and the audience voting app are all Temporal workflows.
-
-Richard owns the shop **and** is the agent — the robot from Replay 2026, now
-working the counter.
+The audience breaks services from their phones while Temporal keeps an order
+moving. An ordering agent talks to a remote MCP server whose every tool call is
+itself a Temporal workflow.
 
 The talk's claim, which every change should serve: **an LLM that retries is not
 the same as a system that resumes. Persistence re-does the work; durability
@@ -19,112 +16,190 @@ audience sees work *not* being redone, measured.
 
 ## Ownership
 
-Two people, two repos. Don't build across the line.
+Two people, five repos. Don't build across the line.
 
 | Piece | Owner |
 |---|---|
 | Agent workflow (`agent/`) | this repo |
-| Stage screen — the projector view (`stage-ui/`) | this repo |
-| API services, MCP server, audience "circuit breaker" site | colleague's repo |
+| Stage screen — the projector view (`agent/src/stage/`) | this repo |
+| MCP server, mock API services, audience board, admin panel | Ian |
 
-The stage screen is a **consumer** of the colleague's component-health feed, not
-a second source of truth. Don't add a `ChaosWorkflow` here without confirming
-who owns that state.
+Ian's repos are the source of truth for every contract. Read them rather than
+guessing, and prefer his dev notes over anything written here:
+
+- `iandouglas/temporal-agntcon-devnotes` — **start here**, `notes-for-melissa.md`
+  is the call sheet and `INTEGRATION-NOTES.md` the detail
+- `iandouglas/temporal-agntcon-mcp` — the MCP server (Python). `DESIGN.md` is good
+- `iandouglas/temporal-agntcon-service` — the mock services (Go)
+- `iandouglas/temporal-agntcon-audience` — the audience board (TypeScript)
+- `iandouglas/temporal-agntcon-testdemo` — admin panel
+
+Everything of his is deployed on Railway. We run Temporal locally for now; his
+tool-call workflows run on his Temporal Cloud. **Two clusters, two UIs** — when
+something looks missing, check you're looking at the right one.
 
 ## Commands
 
 ```bash
 cd agent
-uv pip install -e ".[dev]"        # after a fresh clone; uv venv --python 3.12 first
-uv run pytest tests/ -q           # 11 tests, no API key needed
+uv venv --python 3.12 && uv pip install -e ".[dev]"
+uv run pytest tests/ -q                  # 17 tests, no API key or network needed
 ```
 
-Full chaos run — three terminals, no API key needed (the model turn is scripted):
+Secrets live in `agent/.env` (gitignored; see `.env.example`). Load per terminal:
 
 ```bash
-temporal server start-dev
-cd agent && uv run uvicorn fake_mcp.server:app --port 8931
-cd agent && uv run python scripts/e2e_chaos.py
+cd agent && set -a && source .env && set +a
 ```
 
-Real model run needs `ANTHROPIC_API_KEY`:
+| What | Command |
+|---|---|
+| Probe Ian's live server | `uv run python scripts/probe_live.py` |
+| Real agent, real model | `uv run python -m richards_agent.worker` + `... .starter` |
+| Supervised worker (survives being killed) | `./scripts/run_worker.sh` |
+| Be the audience | `uv run python scripts/audience.py kill agent_worker` |
+| Local chaos run, scripted model | `uv run python scripts/e2e_chaos.py` |
 
-```bash
-cd agent && uv run python -m richards_agent.worker      # terminal A
-cd agent && uv run python -m richards_agent.starter     # terminal B
-```
+`MCP_ENDPOINT` defaults to Ian's live server. Point it at
+`http://localhost:8931/mcp` to use the local fake instead.
 
-## The invariant that matters most
+## The four protocol traps
 
-`agent/src/richards_agent/mcp_client.py::_classify()` draws one line:
+From Ian's notes, all verified against the live server. Each is silent in
+rehearsal and fatal once the audience holds a service down — which is exactly
+when you'd be discovering it. All four are handled in `mcp_client.py`; don't
+undo them.
 
-- **Infrastructure failure** (503, 429, connection refused, timeout, JSON-RPC
-  error) → **raise**. Temporal retries with backoff. The model is never
-  re-prompted, so no tokens are re-spent.
-- **Business outcome** (out of stock, card declined, bad address) → **return**
-  with `is_error=True`. The activity *succeeds*; the result reaches the model,
-  which re-plans.
+1. **`MCP-Protocol-Version: 2026-07-28` on every request.** Omit it and the
+   server routes you to the legacy transport with no SSE keepalive; the call
+   dies at ~5 minutes behind Railway's proxy.
+2. **`params._meta` must carry both `io.modelcontextprotocol/*` envelope keys** —
+   on *every* method, `tools/list` included. Without them: instant `-32602`.
+3. **Responses are JSON *or* SSE.** Calls running silent past ~15s upgrade to
+   `text/event-stream` with `: ping` comments. A JSON-only parser passes every
+   test until a service is held down.
+4. **Timeouts above 15 minutes.** His wait cap is 840s, Railway's ceiling 900s.
+   Our client reads for 960s and the activity's `start_to_close` is 17 min.
 
-Why it matters: the agent runs unlimited retries. If a business outcome is
-raised instead of returned, `execute_activity` never returns, the result never
-lands in `messages`, and the model is never asked again. The workflow sits there
-hammering a tool that is working correctly. On stage that reads as "durable
-execution is stuck," which is the opposite of the point.
+## The mental model — the thing most likely to be got wrong
 
-`tests/test_agent.py::test_out_of_stock_is_not_retried` guards this. If you
-change error handling and that test starts failing with a retry storm, the fix
-is the classification, not the test.
+> **A tool call never fails because a service is down. It just takes longer.**
+
+Ian's server absorbs downstream failures and retries internally, so a broken
+service is a *slow call*, never a failed one. Every call eventually returns
+`completed: true`.
+
+Consequences:
+
+- **Don't build error states for "service down."** You will never see one.
+- `attempts` in the response is effectively **seconds of outage** — Temporal's
+  retry timers floor at 1s, so his configured 250ms interval measures as ~1/sec.
+  Narrate it that way; don't hardcode a rate in a label.
+- **You cannot detect switch state from the call path.** Get it from the
+  audience board, never by inference.
+- **"Activity retries with backoff" is Ian's story now**, not ours. Ours is
+  *resumed without redoing the work* — worker kill, replay, tokens not re-spent.
+  Worth keeping straight so the two of you don't narrate the same beat.
+
+## Failure taxonomy in `mcp_client.py`
+
+Two exception types draw the line:
+
+- `McpInfrastructureError` → **raised**, Temporal retries. The MCP server itself
+  unreachable, or our stream severed. Retrying is safe because the idempotency
+  key attaches it to the original workflow.
+- `McpProtocolError` → **raised non-retryable**. We got the request wrong (bad
+  token, malformed params). Retrying can't fix it, so fail fast and loudly.
+- A tool result with `isError: true` → **returned** to the model as a business
+  outcome it can re-plan around.
+
+That third path currently **cannot happen**: Ian's services return only
+`200 {"<name>": true}` or a bare `500`, so there are no business outcomes. The
+path costs nothing and is where out-of-stock would land if he adds a third mode.
+`tests/test_agent.py::test_out_of_stock_is_not_retried` guards it either way —
+if it starts failing with a retry storm, fix the classification, not the test.
 
 ## Conventions in this repo
 
-- **Never hardcode tool names.** Tools are discovered at runtime via
-  `tools/list` because the MCP server's tool names come from *its* env vars. The
-  agent doesn't know what Richard sells until it asks — which is also a line in
-  the talk.
+- **Never hardcode tool names.** Discovered at runtime; they come from Ian's
+  Railway env vars and have already changed once (`order_coffee` →
+  `order_churro`). `/healthz` is public and lists them without auth.
 - **No retry logic in workflow or activity code.** Retrying is a `RetryPolicy`
-  argument. `FOREVER` in `workflow.py` uses `maximum_attempts=0`, which means
-  unlimited — that's deliberate, and it's what lets you dare the room to stop
-  the order.
-- **`max_retries=0` on the Anthropic client.** The SDK retries 429s and 5xxs
-  internally by default, which would bury a rate limit inside the activity where
-  Temporal can't see it, back off from it, or show it on the timeline. Temporal
-  is the retry layer. Don't "fix" this.
-- **Idempotency keys are derived from workflow state only** —
-  `f"{workflow_id}-t{turn}-c{index}"`. Never `uuid4()`, not even
+  argument. `FOREVER` uses `maximum_attempts=0` — unlimited, deliberately, and
+  it's what lets you dare the room to stop the order.
+- **`max_retries=0` on the Anthropic client.** The SDK retries 429s internally
+  by default, which would bury a rate limit inside the activity where Temporal
+  can't see it, back off from it, or show it on the timeline. Don't "fix" this.
+- **Idempotency keys derive from workflow state only** —
+  `f"{workflow_id}-t{turn}-c{index}"`. Never a UUID, not even
   `workflow.uuid4()`: the key must be byte-identical across replays, or a
-  retried `take_payment` looks like a new charge.
-- **Don't cache business errors against an idempotency key.** The agent restocks
-  and retries the same logical call; serving it a stale out-of-stock result
-  wedges the order permanently. See `fake_mcp/server.py` — only successful
-  results are remembered.
+  re-issued call reads as a brand new order.
+- **Dedup is counted from `activity.info().attempt`**, not from the server.
+  Attempt 2+ means the first attempt already reached the MCP server and the key
+  is the only reason we didn't order twice. Needs nothing from Ian.
 - **`os._exit(1)` in the worker watchdog is intentional.** A graceful drain
-  would finish in-flight activities and prove nothing. The audience needs a real
-  crash.
-
-## Model configuration
-
-`AGENT_MODEL` defaults to `claude-opus-5`. Stage latency is **unmeasured** — no
-real model run has happened yet. Time a full order end to end before deciding
-whether to drop to `claude-haiku-4-5`; that's a stopwatch decision, not a
-guess. `AGENT_EFFORT` defaults to `low` because this is a simple, well-specified
-tool loop and dead air on stage is expensive.
+  would finish in-flight activities and prove nothing.
 
 ## `fake_mcp/` is scaffolding
 
-It exists so the agent could be built before the real MCP server was ready. It
-is **not** the real thing: no Temporal, no workflow per tool call, dedup is a
-dict. It does implement the classification contract correctly, which is the
-point. Delete it once the real endpoint is up and stable.
+A local stand-in for Ian's server *and* the audience board, so the agent can be
+developed and rehearsed offline. It mirrors his observable contract — envelope
+enforcement, `structuredContent`, blocking-and-SSE on a broken service, dedup by
+key — but it is not Temporal-backed, and dedup is a dict.
 
-## Open integration questions
+It is easy to make this file lie. An earlier version returned `503` for a
+downed service, which trained the agent for a failure mode that does not exist.
+If you change it, change it toward what the real server does.
 
-Unresolved with the colleague — check before assuming any of them:
+## Model configuration
 
-- Does the real MCP server return out-of-stock as a **result** or an **error**?
-- Will tool results carry `_meta.deduplicated` when a retried call attaches to
-  an existing execution? Dedup happens inside their MCP server, so the agent can
-  only count it if they report it — and it's the number behind the demo's best
-  moment ("charged exactly once").
-- Does the server read the idempotency key from the `Idempotency-Key` header or
-  MCP `_meta.idempotencyKey`? The agent currently sends both.
-- Who owns component-health state?
+`AGENT_MODEL` defaults to `claude-opus-5`; `AGENT_EFFORT` to `low`, because this
+is a simple well-specified tool loop and dead air on stage is expensive.
+`AGENT_THINKING=off` disables thinking entirely.
+
+A real model run works, but **stage latency has never been timed.** Do that with
+a stopwatch before deciding whether to drop to `claude-haiku-4-5`. Keep
+`AGENT_MAX_TOKENS` well above the thinking budget — a truncated turn used to
+read as "order finished" until that was made a loud failure.
+
+## Open decisions with Ian
+
+From `notes-for-melissa.md` §7 — these need a conversation, not a code change:
+
+- **Tools take zero arguments** and can't report business outcomes, so the agent
+  calls four tools in order with no branch. A `for` loop would look identical,
+  and an AI-conference audience will notice. Adding a third return mode is
+  *moderate* work in his Go service.
+- **Health: booleans or 0–100?** He recommends services stay binary with HP held
+  in the board. The stage-screen prototype assumed 0–100.
+- **Who owns the snapshot translation** — his board's shape, or ours.
+- **Where does the stage screen run?** Inside his Railway project it gets
+  `/admin/live` for free. Outside, he'd have to expose port 8081 publicly, which
+  puts the admin control plane on the internet behind one token.
+
+## The stage screen
+
+`agent/src/stage/` — FastAPI backend that merges our workflow state with Ian's
+board and pushes full snapshots over SSE to a single page. Run it with
+`uvicorn stage.server:app --port 8900`.
+
+Two things in it are load-bearing:
+
+- **`board.py` accepts booleans *or* percentages.** The deployed board reports
+  booleans; Ian is moving to a 0-100 tug-of-war with a threshold at 50. Both
+  shapes are tested. Don't collapse it to one until the new one has been live a
+  while.
+- **"Tokens not re-spent" is measured, not modelled.** When the worker dies the
+  workflow query stops answering; when it answers again the workflow has
+  replayed and `tokens_spent` comes back *unchanged*, because completed
+  `llm_turn`s were served from history. At each recovery we bank the tokens
+  already in history. That number is defensible because it describes something
+  that happened, not a hypothetical naive agent.
+  `collector.py` also distinguishes a closed workflow from a dead worker, so a
+  clean finish doesn't log a fake death at the end of every run.
+
+## Not built yet
+
+- **LLM chaos.** `llm_api` appears in the health feed but breaking it does
+  nothing — the Anthropic proxy was never written. This is the one chaos target
+  only we can build, and it's the one the slide build-up promises.

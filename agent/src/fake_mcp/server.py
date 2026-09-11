@@ -1,36 +1,74 @@
-"""A stand-in for Richard's MCP server.
+"""A local stand-in for Ian's durable MCP server + audience board.
 
-Exists so the agent can be built and broken before the real server is ready.
-It is NOT the real thing and makes no claim to be — no Temporal, no workflow
-per tool call, dedup faked with a dict. Delete it once the real endpoint is up.
+Mirrors the observable contract of the real thing so the agent can be developed
+and rehearsed offline. Crucially it copies the *behaviour* that matters:
 
-It does implement the one contract that matters, so the agent is developed
-against the right shape from day one:
+    a tool call never fails because a service is down — it just takes longer
 
-    out of stock  -> 200, isError: true   (a business outcome the model reads)
-    server down   -> 503                   (a fault Temporal retries)
+A broken service here is absorbed and retried internally, with the call
+blocking and upgrading to SSE, exactly as Railway does. An earlier version of
+this file returned 503 instead, which trained the agent for a failure mode that
+does not exist.
 
-Run:  uv run uvicorn fake_mcp.server:app --port 8931
-Break: curl -X POST localhost:8931/chaos/mcp_worker/down
-Fix:   curl -X POST localhost:8931/chaos/mcp_worker/up
+What it is NOT: Temporal-backed. Tool calls are asyncio loops, not workflows,
+and dedup is a dict. Delete this once the real server is the only target.
+
+Run:    uv run uvicorn fake_mcp.server:app --port 8931
+Break:  uv run python scripts/audience.py break service_1
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-# Components that die and get restarted by a supervisor, rather than just
-# refusing work. A hard break has to heal on its own or the demo stalls: the
-# audience gets to kill the worker, not to keep it dead forever.
-HARD_BREAK = {"agent_worker", "mcp_worker"}
+PROTOCOL_VERSION = "2026-07-28"
+
+# Ian's live tool names, in service order. Read from /healthz in real life —
+# these have already changed once (order_coffee -> order_churro).
+SERVICES: list[dict[str, str]] = [
+    {"key": "service_1", "name": "order_taco", "title": "Order Taco",
+     "description": "Place an order for a taco and wait until the kitchen confirms it."},
+    {"key": "service_2", "name": "order_churro", "title": "Order Churro",
+     "description": "Place an order for a churro and wait until the kitchen confirms it."},
+    {"key": "service_3", "name": "restock_inventory", "title": "Restock Inventory",
+     "description": "Reorder stock from the supplier and wait for confirmation."},
+    {"key": "service_4", "name": "send_receipt", "title": "Send Receipt",
+     "description": "Send the customer their receipt and wait for delivery confirmation."},
+]
+BY_NAME = {s["name"]: s for s in SERVICES}
+
+# Temporal's retry timers floor at one second, so on the real server `attempts`
+# is effectively seconds of outage. Shrunk here so tests aren't slow.
+ATTEMPT_INTERVAL = float(os.getenv("FAKE_ATTEMPT_INTERVAL", "1.0"))
+# Real server commits SSE after ~15s of silence.
+SSE_AFTER = float(os.getenv("FAKE_SSE_AFTER", "15.0"))
+MAX_WAIT = float(os.getenv("FAKE_MAX_WAIT", "840.0"))
 RESTART_SECONDS = float(os.getenv("FAKE_RESTART_SECONDS", "5.0"))
+AGENT_TOKEN = os.getenv("FAKE_AGENT_TOKEN", "")  # empty = accept anything
+
+HARD_BREAK = {"agent_worker", "mcp_worker"}
+
+HEALTH: dict[str, int] = {
+    "agent_worker": 100,
+    "llm_api": 100,
+    "mcp_worker": 100,
+    "service_1": 100,
+    "service_2": 100,
+    "service_3": 100,
+    "service_4": 100,
+}
+DOWN_AT: dict[str, float] = {}
+SEEN: dict[str, dict] = {}
+LEDGER: dict[str, int] = {"ordered": 0, "fulfilled": 0}
 
 
 @asynccontextmanager
@@ -41,11 +79,9 @@ async def lifespan(app: FastAPI):
 
 
 async def _supervisor() -> None:
-    """Bring downed workers back a few seconds later.
+    """Bring killed workers back, so the room can't stall the demo forever.
 
-    Stands in for a docker restart policy. Health comes back low, not full, so
-    a couple of breakers can put it straight back down — which is the fight we
-    want, rather than a component that's either pristine or permanently dead.
+    Health returns degraded rather than full — easy to knock down again.
     """
     while True:
         await asyncio.sleep(0.5)
@@ -57,205 +93,194 @@ async def _supervisor() -> None:
                     DOWN_AT[name] = 0.0
 
 
-app = FastAPI(title="fake Richard's MCP", lifespan=lifespan)
-
-# --- mutable world state --------------------------------------------------
-STATE: dict[str, Any] = {
-    "chicken_lb": 2.0,          # deliberately short — this is the branch point
-    "orders": {},
-    "payments": {},
-    "receipts": {},
-}
-
-# Component health, mirroring what the real chaos feed will provide.
-# agent_worker and llm_api are not this server's business — it just carries
-# their health so the agent's watchdog and LLM proxy have somewhere to read it
-# until the real audience site exists.
-HEALTH: dict[str, int] = {
-    "agent_worker": 100,
-    "llm_api": 100,
-    "mcp_worker": 100,
-    "payment_api": 100,
-    "email_api": 100,
-    "inventory_api": 100,
-}
-
-# monotonic timestamp a hard-break component went down, for the supervisor.
-DOWN_AT: dict[str, float] = {}
-
-# idempotency_key -> the result we already produced for it.
-SEEN: dict[str, dict] = {}
-
-SPECIALS = {
-    0: "Menudo Monday", 1: "Taco Tuesday", 2: "Chile Relleno Wednesday",
-    3: "Tinga Thursday", 4: "Fajita Friday", 5: "Sopes Saturday", 6: "Sunday Pozole",
-}
-
-TOOLS = [
-    {
-        "name": "get_specials",
-        "description": "Today's special at Richard's. Call this before ordering.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "order_a_taco",
-        "description": (
-            "Place a taco order. Returns an error result if an ingredient is out "
-            "of stock — order more inventory, then try again."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "item": {"type": "string"},
-                "quantity": {"type": "integer"},
-            },
-            "required": ["item", "quantity"],
-        },
-    },
-    {
-        "name": "order_more_inventory",
-        "description": "Order more of an ingredient from the supplier. Waits for delivery.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "ingredient": {"type": "string"},
-                "pounds": {"type": "number"},
-            },
-            "required": ["ingredient", "pounds"],
-        },
-    },
-    {
-        "name": "take_payment",
-        "description": "Charge the customer. IRREVERSIBLE — call exactly once per order.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"order_id": {"type": "string"}, "amount": {"type": "number"}},
-            "required": ["order_id", "amount"],
-        },
-    },
-    {
-        "name": "email_receipt",
-        "description": "Email the receipt. IRREVERSIBLE — call exactly once per order.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"order_id": {"type": "string"}, "email": {"type": "string"}},
-            "required": ["order_id", "email"],
-        },
-    },
-]
-
-TOOL_COMPONENT = {
-    "take_payment": "payment_api",
-    "email_receipt": "email_api",
-    "order_more_inventory": "inventory_api",
-}
+app = FastAPI(title="fake durable MCP", lifespan=lifespan)
 
 
-def _ok(text: str, meta: dict | None = None) -> dict:
-    result: dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": False}
-    if meta:
-        result["_meta"] = meta
-    return result
+# --------------------------------------------------------------------------
+# public: no auth, this is how the agent learns the tool names
+# --------------------------------------------------------------------------
+@app.get("/healthz")
+async def healthz() -> dict:
+    return {"ok": True, "tools": [s["name"] for s in SERVICES]}
 
 
-def _business_error(text: str) -> dict:
-    """A tool that ran and has bad news. 200 OK, isError true — the model's problem."""
-    return {"content": [{"type": "text", "text": text}], "isError": True}
+# --------------------------------------------------------------------------
+# MCP
+# --------------------------------------------------------------------------
+def _rpc_error(req_id: Any, code: int, message: str) -> JSONResponse:
+    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 
-async def _run_tool(name: str, args: dict) -> dict:
-    if name == "get_specials":
-        # Fixed day so the demo says the same thing at every rehearsal.
-        return _ok(f"Today is {SPECIALS[4]}. Fajita plate is $6.50.")
+def _check_envelope(params: dict) -> str | None:
+    """The real server rejects any request whose params._meta lacks these."""
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return (
+            "params._meta must be an object carrying the required "
+            "'io.modelcontextprotocol/protocolVersion' and "
+            "'io.modelcontextprotocol/clientCapabilities' envelope keys"
+        )
+    for key in (
+        "io.modelcontextprotocol/protocolVersion",
+        "io.modelcontextprotocol/clientCapabilities",
+    ):
+        if key not in meta:
+            return f"params._meta is missing required envelope key '{key}'"
+    return None
 
-    if name == "order_a_taco":
-        qty = int(args.get("quantity", 1))
-        needed = qty * 0.25
-        if STATE["chicken_lb"] < needed:
-            return _business_error(
-                f"OUT_OF_STOCK: chicken. Need {needed:.2f} lb, have "
-                f"{STATE['chicken_lb']:.2f} lb. Order more inventory first."
-            )
-        STATE["chicken_lb"] -= needed
-        order_id = f"4471"
-        STATE["orders"][order_id] = {"item": args.get("item"), "quantity": qty}
-        return _ok(f"Order {order_id} placed: {qty} x {args.get('item')}. Total $14.20.")
 
-    if name == "order_more_inventory":
-        pounds = float(args.get("pounds", 10))
-        await asyncio.sleep(2.0)  # the delivery truck
-        STATE["chicken_lb"] += pounds
-        return _ok(f"Delivered {pounds:.0f} lb of {args.get('ingredient')}.")
+def _tool_table() -> list[dict]:
+    return [
+        {
+            "name": s["name"],
+            "title": s["title"],
+            "description": s["description"],
+            "inputSchema": {"type": "object", "properties": {}, "title": f"{s['name']}Arguments"},
+            "outputSchema": {"type": "object", "additionalProperties": True},
+        }
+        for s in SERVICES
+    ]
 
-    if name == "take_payment":
-        order_id = str(args.get("order_id", "4471"))
-        STATE["payments"][order_id] = args.get("amount")
-        return _ok(f"Charged ${args.get('amount')} for order {order_id}.")
 
-    if name == "email_receipt":
-        order_id = str(args.get("order_id", "4471"))
-        STATE["receipts"][order_id] = args.get("email")
-        return _ok(f"Receipt for order {order_id} emailed.")
+def _available(service_key: str) -> bool:
+    return HEALTH.get("mcp_worker", 100) > 0 and HEALTH.get(service_key, 100) > 0
 
-    return _business_error(f"UNKNOWN_TOOL: {name}")
+
+def _success(service: dict, attempts: int, key: str) -> dict:
+    short = service["name"].replace("order_", "").replace("_inventory", "").replace("send_", "")
+    return {
+        "service": service["title"],
+        "completed": True,
+        "response": {short: True},
+        "attempts": attempts,
+        "workflow_id": f"{service['name']}-{key}",
+    }
 
 
 @app.post("/mcp")
-async def mcp(request: Request, idempotency_key: str | None = Header(None)) -> JSONResponse:
+async def mcp(request: Request, authorization: str | None = Header(None)) -> Any:
+    if AGENT_TOKEN and authorization != f"Bearer {AGENT_TOKEN}":
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
     body = await request.json()
-    method = body.get("method")
     req_id = body.get("id", 1)
+    method = body.get("method")
+    params = body.get("params") or {}
+
+    # Enforced on EVERY method, tools/list included — verified against the
+    # real server, which is why the agent sends it unconditionally.
+    problem = _check_envelope(params)
+    if problem:
+        return _rpc_error(req_id, -32602, problem)
 
     if method == "tools/list":
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
+        return JSONResponse({
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {"cacheScope": "private", "resultType": "complete",
+                       "tools": _tool_table(), "ttlMs": 30000},
+        })
 
     if method != "tools/call":
-        return JSONResponse(
-            {"jsonrpc": "2.0", "id": req_id,
-             "error": {"code": -32601, "message": f"unknown method {method}"}}
-        )
+        return _rpc_error(req_id, -32601, f"unknown method {method}")
 
-    params = body.get("params") or {}
     name = params.get("name")
-    args = params.get("arguments") or {}
-    key = idempotency_key or (params.get("_meta") or {}).get("idempotencyKey") or ""
+    service = BY_NAME.get(name)
+    if service is None:
+        return _rpc_error(req_id, -32602, f"unknown tool '{name}'")
 
-    # --- infrastructure failures: 503, the agent must not "handle" these ---
-    if HEALTH.get("mcp_worker", 100) <= 0:
-        return JSONResponse({"error": "mcp worker down"}, status_code=503)
-    component = TOOL_COMPONENT.get(name)
-    if component and HEALTH.get(component, 100) <= 0:
-        return JSONResponse({"error": f"{component} unreachable"}, status_code=503)
+    key = (params.get("_meta") or {}).get("idempotencyKey") or f"anon-{uuid.uuid4().hex[:8]}"
 
-    # --- idempotency: a retried call attaches, it does not run again -------
-    if key and key in SEEN:
-        cached = dict(SEEN[key])
-        cached["_meta"] = {**(cached.get("_meta") or {}), "deduplicated": True}
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": cached})
+    # A retried call attaches to the original instead of ordering a second taco.
+    if key in SEEN:
+        result = dict(SEEN[key])
+        return JSONResponse({
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {"structuredContent": result,
+                       "content": [{"type": "text", "text": json.dumps(result)}],
+                       "isError": False,
+                       "_meta": {"deduplicated": True}},
+        })
 
-    result = await _run_tool(name, args)
-    # Only successful, irreversible work is worth remembering. Caching a
-    # business error would stop the agent from retrying after it restocks.
-    if key and not result.get("isError"):
+    LEDGER["ordered"] += 1
+
+    # Fast path: available right now, answer as plain JSON.
+    if _available(service["key"]):
+        result = _success(service, 1, key)
         SEEN[key] = result
+        LEDGER["fulfilled"] += 1
+        return JSONResponse({
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {"structuredContent": result,
+                       "content": [{"type": "text", "text": json.dumps(result)}],
+                       "isError": False},
+        })
 
-    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
+    # Slow path: the service is down. Do NOT fail — block, retry, and stream
+    # keepalive pings, which is what the real transport does past ~15s.
+    return StreamingResponse(
+        _retry_stream(service, key, req_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
-# --- chaos controls, standing in for the real audience site ---------------
+async def _retry_stream(service: dict, key: str, req_id: Any):
+    started = time.monotonic()
+    attempts = 0
+    last_ping = started
+
+    while True:
+        attempts += 1
+        if _available(service["key"]):
+            result = _success(service, attempts, key)
+            SEEN[key] = result
+            LEDGER["fulfilled"] += 1
+            payload = {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"structuredContent": result,
+                           "content": [{"type": "text", "text": json.dumps(result)}],
+                           "isError": False},
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            return
+
+        now = time.monotonic()
+        if now - started > MAX_WAIT:
+            payload = {
+                "jsonrpc": "2.0", "id": req_id,
+                "error": {"code": -32000,
+                          "message": f"tool call exceeded max wait; workflow "
+                                     f"{service['name']}-{key} still running"},
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            return
+
+        # Keepalive comments are the only reason a 14-minute call survives a proxy.
+        if now - last_ping >= min(SSE_AFTER, 15.0):
+            last_ping = now
+            yield ": ping\n\n"
+
+        await asyncio.sleep(ATTEMPT_INTERVAL)
+
+
+# --------------------------------------------------------------------------
+# audience board stand-in
+# --------------------------------------------------------------------------
 @app.get("/chaos")
 async def chaos_state() -> dict:
     return HEALTH
 
 
+@app.get("/ledger")
+async def ledger() -> dict:
+    """ordered - fulfilled is the gap: how many orders are stuck in retry."""
+    return {**LEDGER, "gap": LEDGER["ordered"] - LEDGER["fulfilled"]}
+
+
 @app.post("/chaos/{component}/tap")
 async def chaos_tap(component: str, delta: int = -20) -> dict:
-    """One audience tap. Negative damages, positive repairs.
-
-    Declared BEFORE the /{action} route below — FastAPI matches in declaration
-    order, so the wildcard would otherwise swallow "tap" as an action and snap
-    health to 100 instead of nudging it.
-    """
+    """One audience tap. Declared before /{action} — FastAPI matches in
+    declaration order and the wildcard would otherwise swallow 'tap'."""
     before = HEALTH.get(component, 100)
     HEALTH[component] = max(0, min(100, before + delta))
     if before > 0 and HEALTH[component] == 0:
@@ -266,12 +291,8 @@ async def chaos_tap(component: str, delta: int = -20) -> dict:
 
 
 @app.post("/chaos/{component}/{action}")
-async def chaos_set(component: str, action: str) -> dict:
-    """Presenter shortcut: down/up snaps health to 0/100 in one call.
-
-    The audience never uses this — a real room only ever taps. Keep it for
-    rehearsal and for the fallback controls if conference wifi collapses.
-    """
+async def chaos_set(component: str, action: str) -> Any:
+    """Presenter shortcut. The real audience only ever taps."""
     if action == "down":
         HEALTH[component] = 0
         DOWN_AT[component] = time.monotonic()
@@ -279,22 +300,20 @@ async def chaos_set(component: str, action: str) -> dict:
         HEALTH[component] = 100
         DOWN_AT[component] = 0.0
     else:
-        return JSONResponse(
-            {"error": f"unknown action '{action}' — use down, up or tap"}, status_code=400
-        )
+        return JSONResponse({"error": f"unknown action '{action}'"}, status_code=400)
     return HEALTH
 
 
 @app.post("/reset")
 async def reset() -> dict:
-    STATE.update({"chicken_lb": 2.0, "orders": {}, "payments": {}, "receipts": {}})
     SEEN.clear()
+    DOWN_AT.clear()
+    LEDGER.update({"ordered": 0, "fulfilled": 0})
     for k in HEALTH:
         HEALTH[k] = 100
-    DOWN_AT.clear()
     return {"reset": True}
 
 
 @app.get("/state")
 async def state() -> dict:
-    return {**STATE, "health": HEALTH, "idempotency_keys_seen": len(SEEN)}
+    return {"health": HEALTH, "ledger": await ledger(), "idempotency_keys_seen": len(SEEN)}

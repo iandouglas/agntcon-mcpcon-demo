@@ -10,8 +10,18 @@ TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", "default")
 TEMPORAL_API_KEY = os.getenv("TEMPORAL_API_KEY")  # set for Temporal Cloud
 
 # --- Richard's MCP server -------------------------------------------------
-# Points at the fake server by default; swap for the real one when it's up.
-MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "http://localhost:8931/mcp")
+# Ian's deployed server. Override to http://localhost:8931/mcp to use the
+# local fake instead.
+MCP_ENDPOINT = os.getenv(
+    "MCP_ENDPOINT", "https://mcp-production-00c3d.up.railway.app/mcp"
+)
+# Required by the real server. Both tokens get rotated after the talk.
+MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")
+
+# Above Railway's 15-minute hard request cap, which sits above the MCP server's
+# own 840s wait cap. A broken service makes a call slow, not failed, so this
+# has to be generous or we'd time out and re-issue work that is still running.
+MCP_CALL_TIMEOUT_SECONDS = float(os.getenv("MCP_CALL_TIMEOUT_SECONDS", "960"))
 
 # --- Model ----------------------------------------------------------------
 # Opus 5 by default. For the stage run, latency matters more than depth —

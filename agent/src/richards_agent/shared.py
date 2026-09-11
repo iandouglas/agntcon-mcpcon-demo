@@ -41,6 +41,20 @@ class ToolCall:
 
 
 @dataclass
+class ToolResult:
+    """What the MCP server told us, before it's tied back to a tool_use block."""
+
+    content: str
+    is_error: bool = False
+    # Ian's server retries a broken downstream internally. `attempts` is the
+    # count, and because Temporal's retry timers floor at 1s it is effectively
+    # seconds of outage — a far better line than "4 retries a second".
+    attempts: int = 0
+    workflow_id: str = ""
+    deduplicated: bool = False
+
+
+@dataclass
 class ToolOutcome:
     """The result of one tool call, as the model will see it.
 
@@ -49,13 +63,16 @@ class ToolOutcome:
     them without the model ever being asked again.
 
     `is_error` is the MCP server saying "the tool ran, and the answer is bad
-    news" (out of stock, card declined). That is a business outcome: it goes
-    back to the model so it can re-plan.
+    news". Ian's services cannot currently produce this (they return only
+    200-true or a bare 500), but the path costs nothing and is where an
+    out-of-stock outcome would land if he adds one.
     """
 
     tool_use_id: str
     content: str
     is_error: bool = False
+    attempts: int = 0
+    workflow_id: str = ""
     deduplicated: bool = False
 
 
@@ -101,6 +118,10 @@ class AgentState:
     tokens_spent: int = 0
     cache_read_tokens: int = 0
     dedup_hits: int = 0
+    # Summed `attempts` across every tool call — roughly total seconds the
+    # audience kept something broken. The headline "how bad was it" number.
+    downstream_attempts: int = 0
     tools_available: list[str] = field(default_factory=list)
+    last_workflow_id: str = ""
     finished: bool = False
     answer: str = ""

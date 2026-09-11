@@ -97,6 +97,9 @@ class TacoOrderAgent:
                 outcome = await self._call_tool(call)
 
                 self.state.tool_calls += 1
+                self.state.downstream_attempts += outcome.attempts
+                if outcome.workflow_id:
+                    self.state.last_workflow_id = outcome.workflow_id
                 if outcome.deduplicated:
                     self.state.dedup_hits += 1
 
@@ -132,7 +135,11 @@ class TacoOrderAgent:
             return await workflow.execute_activity(
                 call_richards_tool,
                 call,
-                start_to_close_timeout=timedelta(minutes=5),
+                # Has to clear Railway's 15-minute request ceiling, which sits
+                # above the MCP server's own 840s wait cap. A service the
+                # audience is holding down makes this call SLOW, not failed —
+                # time out early and we re-issue work that is still running.
+                start_to_close_timeout=timedelta(minutes=17),
                 retry_policy=FOREVER,
             )
         except ApplicationError as exc:

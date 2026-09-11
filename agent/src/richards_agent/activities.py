@@ -42,9 +42,12 @@ async def list_richards_tools() -> list[ToolSpec]:
     """
     activity.logger.info("discovering tools at %s", config.MCP_ENDPOINT)
     try:
-        return await mcp_client.list_tools(config.MCP_ENDPOINT)
+        tools = await mcp_client.list_tools(config.MCP_ENDPOINT, config.MCP_AUTH_TOKEN)
     except mcp_client.McpProtocolError as exc:
         raise ApplicationError(str(exc), type="McpProtocolError", non_retryable=True) from exc
+
+    activity.logger.info("discovered: %s", ", ".join(t.name for t in tools))
+    return tools
 
 
 @activity.defn
@@ -173,11 +176,13 @@ async def call_richards_tool(call: ToolCall) -> ToolOutcome:
     activity.logger.info("calling %s (key=%s)", call.name, call.idempotency_key)
 
     try:
-        content, is_error, deduplicated = await mcp_client.call_tool(
+        result = await mcp_client.call_tool(
             config.MCP_ENDPOINT,
+            config.MCP_AUTH_TOKEN,
             call.name,
             call.arguments,
             call.idempotency_key,
+            read_seconds=config.MCP_CALL_TIMEOUT_SECONDS,
         )
     except mcp_client.McpProtocolError as exc:
         # Retrying a malformed call just wastes stage time. Fail it terminally
@@ -185,12 +190,33 @@ async def call_richards_tool(call: ToolCall) -> ToolOutcome:
         raise ApplicationError(str(exc), type="McpProtocolError", non_retryable=True) from exc
     # McpInfrastructureError deliberately propagates: Temporal retries it.
 
-    if deduplicated:
-        activity.logger.info("%s attached to an existing execution", call.name)
+    if result.attempts > 1:
+        activity.logger.info(
+            "%s took %s attempts (~%ss of outage)", call.name, result.attempts, result.attempts
+        )
+
+    # Was this call re-issued? If our activity is on attempt 2+, the first
+    # attempt already reached the MCP server (severed stream, timeout) and the
+    # idempotency key is the only reason we aren't ordering a second taco.
+    #
+    # Derived from Temporal rather than from the server's response: Ian's
+    # server does not currently set _meta.deduplicated, and we don't need it
+    # to — this is measurable entirely on our side. Honour the flag too, in
+    # case he adds it.
+    reissued = activity.info().attempt > 1
+    if reissued or result.deduplicated:
+        activity.logger.info(
+            "%s was re-issued (activity attempt %s) — idempotency key attached it "
+            "to the original workflow",
+            call.name,
+            activity.info().attempt,
+        )
 
     return ToolOutcome(
         tool_use_id=call.tool_use_id,
-        content=content,
-        is_error=is_error,
-        deduplicated=deduplicated,
+        content=result.content,
+        is_error=result.is_error,
+        attempts=result.attempts,
+        workflow_id=result.workflow_id,
+        deduplicated=result.deduplicated or reissued,
     )
