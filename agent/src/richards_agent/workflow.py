@@ -28,6 +28,13 @@ FOREVER = RetryPolicy(
 )
 
 
+# Without this, Temporal waits out start_to_close before it will believe a
+# worker is dead — up to 17 minutes for a tool call. With it, a killed worker is
+# noticed in seconds and the activity is rescheduled on the replacement. The
+# activities heartbeat every 2s (see activities._heartbeat_while).
+HEARTBEAT_TIMEOUT = timedelta(seconds=5)
+
+
 @workflow.defn
 class TacoOrderAgent:
     def __init__(self) -> None:
@@ -48,6 +55,7 @@ class TacoOrderAgent:
         tools = await workflow.execute_activity(
             list_richards_tools,
             start_to_close_timeout=timedelta(seconds=30),
+            heartbeat_timeout=HEARTBEAT_TIMEOUT,
             retry_policy=FOREVER,
         )
         self.state.tools_available = [t.name for t in tools]
@@ -67,6 +75,7 @@ class TacoOrderAgent:
                     turn=turn,
                 ),
                 start_to_close_timeout=timedelta(seconds=120),
+                heartbeat_timeout=HEARTBEAT_TIMEOUT,
                 retry_policy=FOREVER,
             )
 
@@ -140,6 +149,7 @@ class TacoOrderAgent:
                 # audience is holding down makes this call SLOW, not failed —
                 # time out early and we re-issue work that is still running.
                 start_to_close_timeout=timedelta(minutes=17),
+                heartbeat_timeout=HEARTBEAT_TIMEOUT,
                 retry_policy=FOREVER,
             )
         except ApplicationError as exc:

@@ -52,10 +52,13 @@ ATTEMPT_INTERVAL = float(os.getenv("FAKE_ATTEMPT_INTERVAL", "1.0"))
 # Real server commits SSE after ~15s of silence.
 SSE_AFTER = float(os.getenv("FAKE_SSE_AFTER", "15.0"))
 MAX_WAIT = float(os.getenv("FAKE_MAX_WAIT", "840.0"))
-RESTART_SECONDS = float(os.getenv("FAKE_RESTART_SECONDS", "5.0"))
 AGENT_TOKEN = os.getenv("FAKE_AGENT_TOKEN", "")  # empty = accept anything
 
-HARD_BREAK = {"agent_worker", "mcp_worker"}
+# Matches Ian's board and the worker watchdog: >= 50 is up.
+THRESHOLD = int(os.getenv("CHAOS_THRESHOLD", "50"))
+
+# 0 = disabled, which is the correct setting. See _auto_heal.
+AUTO_HEAL_SECONDS = float(os.getenv("FAKE_AUTO_HEAL_SECONDS", "0"))
 
 HEALTH: dict[str, int] = {
     "agent_worker": 100,
@@ -73,23 +76,29 @@ LEDGER: dict[str, int] = {"ordered": 0, "fulfilled": 0}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_supervisor())
+    # Nothing to supervise. A component the room broke stays broken until the
+    # room fixes it — see the note on AUTO_HEAL_SECONDS.
+    task = asyncio.create_task(_auto_heal()) if AUTO_HEAL_SECONDS else None
     yield
-    task.cancel()
+    if task:
+        task.cancel()
 
 
-async def _supervisor() -> None:
-    """Bring killed workers back, so the room can't stall the demo forever.
+async def _auto_heal() -> None:
+    """Off by default, and it should stay off.
 
-    Health returns degraded rather than full — easy to knock down again.
+    This used to revive killed workers unconditionally after a few seconds,
+    which made the audience's kill cosmetic and their fixers decorative. The
+    tug-of-war only means something if a break persists until someone repairs
+    it. Set FAKE_AUTO_HEAL_SECONDS only to rehearse alone.
     """
     while True:
         await asyncio.sleep(0.5)
         now = time.monotonic()
-        for name in HARD_BREAK:
-            if HEALTH.get(name, 100) <= 0 and DOWN_AT.get(name):
-                if now - DOWN_AT[name] >= RESTART_SECONDS:
-                    HEALTH[name] = 30
+        for name in list(HEALTH):
+            if HEALTH[name] < THRESHOLD and DOWN_AT.get(name):
+                if now - DOWN_AT[name] >= AUTO_HEAL_SECONDS:
+                    HEALTH[name] = 100
                     DOWN_AT[name] = 0.0
 
 
@@ -143,7 +152,12 @@ def _tool_table() -> list[dict]:
 
 
 def _available(service_key: str) -> bool:
-    return HEALTH.get("mcp_worker", 100) > 0 and HEALTH.get(service_key, 100) > 0
+    """A service is callable when both it and the MCP server are above the
+    threshold — same rule the board and the worker watchdog use."""
+    return (
+        HEALTH.get("mcp_worker", 100) >= THRESHOLD
+        and HEALTH.get(service_key, 100) >= THRESHOLD
+    )
 
 
 def _success(service: dict, attempts: int, key: str) -> dict:

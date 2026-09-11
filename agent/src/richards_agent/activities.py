@@ -8,6 +8,9 @@ uses to attach to an existing execution instead of running twice.
 
 from __future__ import annotations
 
+import asyncio
+from typing import Awaitable, TypeVar
+
 import anthropic
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -16,6 +19,37 @@ from . import config, mcp_client
 from .shared import LlmTurn, LlmTurnInput, LlmUsage, ToolCall, ToolOutcome, ToolSpec
 
 _client: anthropic.AsyncAnthropic | None = None
+
+T = TypeVar("T")
+
+# How often to heartbeat while an activity is blocked. Paired with the
+# heartbeat_timeout set on each execute_activity call in workflow.py.
+HEARTBEAT_INTERVAL = 2.0
+
+
+async def _heartbeat_while(work: Awaitable[T], interval: float = HEARTBEAT_INTERVAL) -> T:
+    """Await `work`, heartbeating to Temporal while it blocks.
+
+    Every activity here is a single long `await` — a model call, or a tool call
+    that may legitimately block for 14 minutes while Ian's server retries a
+    downed service. Without heartbeats Temporal cannot distinguish "this worker
+    is working hard" from "this worker is dead", so it waits out
+    start_to_close before rescheduling. For call_richards_tool that is 17
+    minutes of a stalled demo after the audience kills the worker.
+
+    With heartbeats it notices in seconds. This is the difference between the
+    kill looking like durable execution and looking like a hang.
+    """
+    task = asyncio.ensure_future(work)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=interval)
+            if task in done:
+                return task.result()
+            activity.heartbeat()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
 
 
 def _anthropic() -> anthropic.AsyncAnthropic:
@@ -42,7 +76,9 @@ async def list_richards_tools() -> list[ToolSpec]:
     """
     activity.logger.info("discovering tools at %s", config.MCP_ENDPOINT)
     try:
-        tools = await mcp_client.list_tools(config.MCP_ENDPOINT, config.MCP_AUTH_TOKEN)
+        tools = await _heartbeat_while(
+            mcp_client.list_tools(config.MCP_ENDPOINT, config.MCP_AUTH_TOKEN)
+        )
     except mcp_client.McpProtocolError as exc:
         raise ApplicationError(str(exc), type="McpProtocolError", non_retryable=True) from exc
 
@@ -75,25 +111,27 @@ async def llm_turn(payload: LlmTurnInput) -> LlmTurn:
     if config.THINKING == "off":
         extra["thinking"] = {"type": "disabled"}
 
+    request = client.messages.create(
+        model=config.MODEL,
+        max_tokens=config.MAX_TOKENS,
+        output_config={"effort": config.EFFORT},
+        **extra,
+        # System prompt and tool list are byte-stable across every turn of
+        # every order, so they cache. Volatile content (the conversation)
+        # comes after, which is where it has to be for the prefix to hold.
+        system=[
+            {
+                "type": "text",
+                "text": config.SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        tools=tools,
+        messages=payload.messages,
+    )
+
     try:
-        response = await client.messages.create(
-            model=config.MODEL,
-            max_tokens=config.MAX_TOKENS,
-            output_config={"effort": config.EFFORT},
-            **extra,
-            # System prompt and tool list are byte-stable across every turn of
-            # every order, so they cache. Volatile content (the conversation)
-            # comes after, which is where it has to be for the prefix to hold.
-            system=[
-                {
-                    "type": "text",
-                    "text": config.SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            tools=tools,
-            messages=payload.messages,
-        )
+        response = await _heartbeat_while(request)
     except anthropic.APIStatusError as exc:
         if exc.status_code >= 500 or exc.status_code == 429:
             # Let it out — Temporal retries with backoff, visibly.
@@ -175,15 +213,20 @@ async def call_richards_tool(call: ToolCall) -> ToolOutcome:
     """
     activity.logger.info("calling %s (key=%s)", call.name, call.idempotency_key)
 
+    request = mcp_client.call_tool(
+        config.MCP_ENDPOINT,
+        config.MCP_AUTH_TOKEN,
+        call.name,
+        call.arguments,
+        call.idempotency_key,
+        read_seconds=config.MCP_CALL_TIMEOUT_SECONDS,
+    )
+
     try:
-        result = await mcp_client.call_tool(
-            config.MCP_ENDPOINT,
-            config.MCP_AUTH_TOKEN,
-            call.name,
-            call.arguments,
-            call.idempotency_key,
-            read_seconds=config.MCP_CALL_TIMEOUT_SECONDS,
-        )
+        # Heartbeating matters most here: this call legitimately blocks for
+        # minutes while Ian's server retries a downed service, so without it
+        # Temporal cannot tell a busy worker from a dead one.
+        result = await _heartbeat_while(request)
     except mcp_client.McpProtocolError as exc:
         # Retrying a malformed call just wastes stage time. Fail it terminally
         # and let the workflow hand the model an error result to react to.
