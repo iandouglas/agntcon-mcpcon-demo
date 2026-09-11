@@ -34,16 +34,24 @@ guessing, and prefer his dev notes over anything written here:
 - `iandouglas/temporal-agntcon-audience` — the audience board (TypeScript)
 - `iandouglas/temporal-agntcon-testdemo` — admin panel
 
-Everything of his is deployed on Railway. We run Temporal locally for now; his
-tool-call workflows run on his Temporal Cloud. **Two clusters, two UIs** — when
-something looks missing, check you're looking at the right one.
+Everything of his is deployed on Railway, including **his own self-hosted
+Temporal** (with Postgres and a temporal-ui service) — not Temporal Cloud,
+whatever his MCP README and `.env.example` say. We run Temporal locally for now,
+so there are **two clusters and two UIs**; when something looks missing, check
+you're looking at the right one. Pointing our worker at his Railway Temporal is
+a deliberate later step.
+
+His services all run 2 replicas and his chaos is purely Redis flags, so **no
+process of his ever dies**. Our agent worker is the only component in the demo
+that actually crashes — which is why the `agent_worker` switch matters and is
+worth framing to him that way.
 
 ## Commands
 
 ```bash
 cd agent
 uv venv --python 3.12 && uv pip install -e ".[dev]"
-uv run pytest tests/ -q                  # 17 tests, no API key or network needed
+uv run pytest tests/ -q                  # 38 tests, no API key or network needed
 ```
 
 Secrets live in `agent/.env` (gitignored; see `.env.example`). Load per terminal:
@@ -55,7 +63,8 @@ cd agent && set -a && source .env && set +a
 | What | Command |
 |---|---|
 | Probe Ian's live server | `uv run python scripts/probe_live.py` |
-| Real agent, real model | `uv run python -m richards_agent.worker` + `... .starter` |
+| Stream orders (what the talk runs on) | `uv run python scripts/order_stream.py` |
+| A single order | `uv run python -m richards_agent.starter` |
 | Supervised worker (survives being killed) | `./scripts/run_worker.sh` |
 | Be the audience | `uv run python scripts/audience.py kill agent_worker` |
 | Local chaos run, scripted model | `uv run python scripts/e2e_chaos.py` |
@@ -197,6 +206,16 @@ Two things in it are load-bearing:
   that happened, not a hypothetical naive agent.
   `collector.py` also distinguishes a closed workflow from a dead worker, so a
   clean finish doesn't log a fake death at the end of every run.
+
+## Two different "start the demo" buttons
+
+They are unrelated and both are needed:
+
+- **Ian's rehearsal console** opens the floor — his switches go from inert to
+  live. Nothing the audience taps registers before that.
+- **`scripts/order_stream.py`** starts orders flowing. This is ours; he has no
+  way to start a `TacoOrderAgent`, and won't until we point at his Railway
+  Temporal.
 
 ## Not built yet
 

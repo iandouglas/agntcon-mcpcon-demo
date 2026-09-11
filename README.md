@@ -3,17 +3,21 @@
 Demo for **"Chaos Engineered: How to Build Invincible Agents and MCP Systems"** —
 AgntCon / MCPCon North America, October 2026.
 
-The audience sabotages a live taco order while Temporal keeps resuming it from
-where it left off. A taco-ordering agent talks to Richard's MCP server; both are
-Temporal workflows, and so is the app the room votes in.
+The audience breaks services from their phones while Temporal keeps a stream of
+orders moving. An ordering agent talks to a remote MCP server whose every tool
+call is itself a Temporal workflow.
+
+One component in the whole demo genuinely dies — our agent worker. Everything of
+Ian's degrades instead: a Redis flag makes calls 503 and Temporal absorbs them.
 
 ## Layout
 
 | Path | Owner | What it is |
 |---|---|---|
-| `agent/` | this repo | The Temporal agent workflow, its activities, and a fake MCP server to develop against |
-| `stage-ui/` | this repo | The projector view (see prototype link below) |
-| — | colleague's repo | API services, MCP server, audience "circuit breaker" site |
+| `agent/src/richards_agent/` | this repo | The agent workflow, its activities, the worker |
+| `agent/src/stage/` | this repo | The projector view — backend + single page |
+| `agent/src/fake_mcp/` | this repo | Local stand-in for Ian's server and board |
+| — | Ian's five repos | MCP server, mock API services, audience board, admin console |
 
 ## Setup, once
 
@@ -21,7 +25,7 @@ Temporal workflows, and so is the app the room votes in.
 cd agent
 uv venv --python 3.12
 uv pip install -e ".[dev]"
-uv run pytest tests/ -q          # 25 tests, no API key or network needed
+uv run pytest tests/ -q          # 38 tests, no API key or network needed
 cp .env.example .env             # then fill it in
 ```
 
@@ -44,8 +48,15 @@ Four long-running terminals, plus one you type into.
 | 2 | Chaos feed for our worker | `cd agent && uv run uvicorn fake_mcp.server:app --port 8931` |
 | 3 | The worker, supervised | `cd agent && ./scripts/run_worker.sh` |
 | 4 | Stage screen (open :8900) | `cd agent && uv run uvicorn stage.server:app --port 8900` |
-| 5 | Start an order | `cd agent && uv run python -m richards_agent.starter` |
+| 5 | Stream orders | `cd agent && uv run python scripts/order_stream.py` |
+| 5 | Or just one order | `cd agent && uv run python -m richards_agent.starter` |
 | 5 | Be the audience | `cd agent && uv run python scripts/audience.py kill agent_worker` |
+
+`order_stream.py` keeps orders arriving — one every 6s, capped at 5 in flight.
+It deliberately keeps starting them while the worker is dead: they queue as
+RUNNING workflows, and when a fixer revives the worker it chews through the
+backlog. That backlog is the demo's argument, and it's what makes "orders
+completed" a number worth projecting.
 
 Terminal 2 is only there because Ian's board tracks *his* services, not our
 agent worker. Its MCP side is unused while `MCP_ENDPOINT` points at Ian's
@@ -63,8 +74,12 @@ is where replay happens, which is the whole demo.
 ### Two clusters, two UIs
 
 Our agent workflow runs on **local Temporal** (:8233). Ian's tool-call workflows
-run on **his Temporal Cloud**. When something looks missing, check you're
-looking at the right one.
+run on **his own Temporal deployed on Railway** — self-hosted with Postgres, not
+Temporal Cloud, whatever his MCP README says. When something looks missing,
+check you're looking at the right one.
+
+Eventually we point our worker at his Railway Temporal and it all becomes one
+cluster with one UI. Deliberately deferred — it's an easy switch later.
 
 ## The thing to understand before changing anything
 
