@@ -18,18 +18,41 @@ the room pushes on the number.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import time
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import httpx
 from temporalio.client import Client
 
+from richards_agent.shared import TASK_QUEUE
+from richards_agent.worker import read_health
 from richards_agent.workflow import TacoOrderAgent
 
 from . import board
 
-MAX_TIMELINE = 60
+log = logging.getLogger(__name__)
+
+# One continuous timeline for the whole session, so a crash from two orders
+# ago is still visible above the current one. Only the last ~24 render.
+MAX_TIMELINE = 200
+
+# Our own chaos feed. The audience board has no switch for the agent worker
+# yet, so its health is read from here instead.
+LOCAL_CHAOS_URL = os.getenv("CHAOS_URL", "http://localhost:8931/chaos")
+LOCAL_COMPONENTS = ("agent_worker",)
+
+# Which components the screen shows. Defaults to just the agent worker, because
+# it is currently the only thing anyone can actually break — Ian's five
+# switches render as permanently UP until he arms the floor, which is noise on
+# a projector. Set STAGE_COMPONENTS=all once the floor is live, or a
+# comma-separated list to pick.
+_only = os.getenv("STAGE_COMPONENTS", "agent_worker").strip()
+SHOW_ALL = _only.lower() in ("", "all", "*")
+SHOW_ONLY = {c.strip() for c in _only.split(",") if c.strip()} if not SHOW_ALL else set()
 
 
 @dataclass
@@ -42,14 +65,21 @@ class Event:
 
 @dataclass
 class Scoreboard:
+    # --- on the projector -------------------------------------------------
+    # Counted across every order since this stage server started, so it keeps
+    # working when several orders are in flight at once.
+    orders_completed: int = 0
+    worker_deaths: int = 0
     turns: int = 0
     tool_calls: int = 0
+
+    # --- collected, shown only in the footer line -------------------------
+    # tokens_not_respent is the thesis number but reads as 0 until something
+    # actually breaks, so it lives in the footer rather than on a big tile.
     tokens_spent: int = 0
     cache_read_tokens: int = 0
-    # Banked work that survived a worker death. See the module docstring.
     tokens_not_respent: int = 0
     calls_served_from_history: int = 0
-    worker_deaths: int = 0
     reissued_calls: int = 0
     # Summed `attempts` from Ian's server — roughly seconds of outage absorbed.
     downstream_attempts: int = 0
@@ -74,23 +104,58 @@ class Collector:
         self._order: dict[str, Any] = {"running": False}
         self._score = Scoreboard()
         self._timeline: list[Event] = []
+        # Session clock. Never restarted — a per-order clock would make
+        # timestamps jump backwards partway down a continuous timeline.
         self._started = time.monotonic()
 
         self._worker_up = True
         self._last_step = ""
         self._last_switches: dict[str, bool] = {}
         self._seq = 0
+        # Separate flag, NOT a field on self._order — that dict is rebuilt from
+        # the query every tick, so a marker written into it is wiped on the
+        # next pass and the completion event re-fires twice a second forever.
+        self._completion_logged = False
+
+        # Order counts come from Temporal visibility rather than from the one
+        # workflow we're following, so they stay correct when several orders
+        # run at once. Scoped to this process's start so a morning of
+        # rehearsals doesn't inflate the number on stage.
+        self._session_start = datetime.now(timezone.utc).isoformat()
+        self._orders_in_flight = 0
+        self._last_count = 0.0
+        self._count_error_logged = False
 
     # ------------------------------------------------------------------ api
+    @property
+    def workflow_id(self) -> str | None:
+        return self._workflow_id
+
     def set_workflow(self, workflow_id: str) -> None:
-        """Follow a different order. Resets the scoreboard; the timeline keeps
-        a marker so it is obvious on screen that the numbers restarted."""
+        """Follow a different order.
+
+        The timeline is NOT cleared and the clock is NOT restarted: it is one
+        continuous log of the whole session, so the room can see the crash from
+        two orders ago still sitting above the current one. Only the per-order
+        numbers reset.
+
+        Cumulative counters also survive — "orders completed" and "worker deaths
+        survived" describe the session, and zeroing them on every new order
+        would erase the tally the audience has been building.
+        """
         self._workflow_id = workflow_id
-        self._score = Scoreboard()
-        self._started = time.monotonic()
+        carried = {
+            "orders_completed": self._score.orders_completed,
+            "worker_deaths": self._score.worker_deaths,
+            "tokens_not_respent": self._score.tokens_not_respent,
+            "calls_served_from_history": self._score.calls_served_from_history,
+        }
+        self._score = Scoreboard(**carried)
         self._worker_up = True
         self._last_step = ""
-        self._push("info", f"now following {workflow_id}")
+        self._completion_logged = False
+        self._order = {"running": False}
+        self._push("info", "new order started", workflow_id)
 
     def snapshot(self) -> dict:
         self._seq += 1
@@ -108,6 +173,7 @@ class Collector:
                 "components": [asdict(c) for c in self._board.components],
             },
             "order": self._order,
+            "orders_in_flight": self._orders_in_flight,
             "scoreboard": asdict(self._score),
             "timeline": [asdict(e) for e in self._timeline[-24:]],
         }
@@ -132,8 +198,49 @@ class Collector:
 
     async def _tick(self, http: httpx.AsyncClient) -> None:
         self._board = await board.fetch(http, self._board_url, self._board_token)
+        for component in await self._local_components(http):
+            self._board.components.append(component)
+        self._board.components = self._visible(self._board.components)
         self._note_switch_changes()
+        await self._count_orders()
         await self._poll_workflow()
+
+    async def _local_components(self, http: httpx.AsyncClient) -> list[board.Component]:
+        """Read the components Ian's board doesn't carry yet.
+
+        Only the agent worker today. Once he adds an `agent_worker` switch this
+        becomes redundant and the component arrives from the board instead —
+        same id, so the screen doesn't change.
+        """
+        if any(c.id in LOCAL_COMPONENTS for c in self._board.components):
+            return []  # the board owns it now; don't double-render
+
+        try:
+            payload = (await http.get(LOCAL_CHAOS_URL, timeout=3.0)).json()
+        except Exception:  # noqa: BLE001 - no local feed is a fine state to be in
+            return []
+
+        found: list[board.Component] = []
+        for component_id in LOCAL_COMPONENTS:
+            health = read_health(payload, component_id)
+            if health is None:
+                continue
+            found.append(
+                board.Component(
+                    id=component_id,
+                    name=component_id.replace("_", " ").upper(),
+                    up=health >= board.THRESHOLD,
+                    percent=health,
+                    kind="worker",
+                    source="local",
+                )
+            )
+        return found
+
+    def _visible(self, components: list[board.Component]) -> list[board.Component]:
+        if SHOW_ALL:
+            return components
+        return [c for c in components if c.id in SHOW_ONLY]
 
     def _note_switch_changes(self) -> None:
         for component in self._board.components:
@@ -146,6 +253,52 @@ class Collector:
                 verb = "back up" if component.up else "taken down"
                 detail = f"{component.percent}%" if component.percent is not None else ""
                 self._push("switch", f"{component.name} {verb}", detail)
+
+    async def _count_orders(self, every: float = 2.0) -> None:
+        """Count orders via visibility, not from the followed workflow.
+
+        Two reasons: several orders can be in flight at once, and the one we
+        follow tells us nothing about the others. Throttled because this is
+        two RPCs, not a local read.
+        """
+        now = time.monotonic()
+        if now - self._last_count < every:
+            return
+        self._last_count = now
+
+        base = (
+            f'WorkflowType = "TacoOrderAgent" AND TaskQueue = "{TASK_QUEUE}" '
+            f'AND StartTime > "{self._session_start}"'
+        )
+        try:
+            completed = await self._client.count_workflows(
+                f'{base} AND ExecutionStatus = "Completed"'
+            )
+            running = await self._client.count_workflows(
+                f'{base} AND ExecutionStatus = "Running"'
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the last known count
+            # Log it. A silent return here means the tile reads 0 forever and
+            # looks like a demo that never completes an order, with nothing
+            # anywhere saying why.
+            if not self._count_error_logged:
+                self._count_error_logged = True
+                log.warning(
+                    "order count query failed, tile will stay at its last value: %s: %s\n"
+                    "  query: %s", type(exc).__name__, exc, base,
+                )
+            return
+
+        if self._count_error_logged:
+            self._count_error_logged = False
+            log.info("order count query recovered")
+
+        if completed.count > self._score.orders_completed:
+            gained = completed.count - self._score.orders_completed
+            self._push("info", f"order{'s' if gained > 1 else ''} completed",
+                       f"{completed.count} since this screen started")
+        self._score.orders_completed = completed.count
+        self._orders_in_flight = running.count
 
     async def _poll_workflow(self) -> None:
         if not self._workflow_id:
@@ -203,9 +356,9 @@ class Collector:
             "last_tool_workflow": state.last_workflow_id,
         }
 
-        if state.finished and self._order.get("status") != "done-logged":
+        if state.finished and not self._completion_logged:
+            self._completion_logged = True
             self._push("info", "order complete", state.answer[:120])
-            self._order["status"] = "done-logged"
 
     async def _workflow_closed(self, handle) -> bool:
         """True if the workflow has finished — so a failing query is expected."""

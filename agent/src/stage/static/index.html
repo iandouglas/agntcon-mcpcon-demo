@@ -74,6 +74,11 @@
   }
   .card.down .card-state{color:var(--broken);background:var(--broken-dim)}
   .card-taps{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--text-faint)}
+  .card-src{
+    font-family:var(--mono);font-size:9px;letter-spacing:.08em;padding:1px 5px;border-radius:3px;
+    color:var(--text-faint);background:var(--panel-2);border:1px solid var(--rule);
+  }
+  .card-src.local{color:var(--replay);border-color:var(--replay-dim);background:var(--replay-dim)}
 
   /* tug-of-war bar: fixers from the left, breakers from the right */
   .tug{position:relative;height:9px;border-radius:5px;overflow:hidden;background:var(--broken)}
@@ -110,8 +115,13 @@
   /* ---------- scoreboard ---------- */
   .sb{margin-top:14px;border-top:1px solid var(--rule);padding-top:12px}
   .sb-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--rule-soft);border-radius:5px;overflow:hidden}
-  .sb-c{background:var(--panel);padding:10px 12px}
-  .sb-c .v{font-family:var(--display);font-weight:700;font-size:25px;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.1}
+  /* Fixed value height: an empty .v used to collapse and drag its label up,
+     which reads as broken padding on one tile while the others look fine. */
+  .sb-c{background:var(--panel);padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-start}
+  .sb-c .v{
+    font-family:var(--display);font-weight:700;font-size:25px;letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums;line-height:1.1;min-height:1.1em;
+  }
   .sb-c .l{font-size:10.5px;color:var(--text-mid);line-height:1.3;margin-top:2px}
   .sb-c.rep .v{color:var(--replay)}
   .sb-c.good .v{color:var(--healthy)}
@@ -124,10 +134,10 @@
 
 <header>
   <div class="brand">MISE EN <span>PANIC</span></div>
-  <div class="wf" id="wf">—</div>
+  <div class="wf" id="wf"></div>
   <div class="spacer"></div>
-  <div class="pill" id="pConns">0 phones</div>
-  <div class="pill" id="pArmed">floor closed</div>
+  <div class="pill" id="pConns">board offline</div>
+  <div class="pill" id="pArmed">—</div>
   <div class="pill" id="pStatus">idle</div>
 </header>
 
@@ -146,12 +156,9 @@
 
     <div class="sb">
       <div class="sb-grid">
-        <div class="sb-c good"><div class="v" id="mTok">0</div><div class="l">tokens not re-spent</div></div>
-        <div class="sb-c rep"><div class="v" id="mHist">0</div><div class="l">calls served from history</div></div>
+        <div class="sb-c good"><div class="v" id="mOrders">0</div><div class="l">orders completed</div></div>
         <div class="sb-c hit"><div class="v" id="mDeaths">0</div><div class="l">worker deaths survived</div></div>
-        <div class="sb-c"><div class="v" id="mAtt">0</div><div class="l">seconds of outage absorbed</div></div>
         <div class="sb-c"><div class="v" id="mTurns">0</div><div class="l">model turns / <span id="mCalls">0</span> tool calls</div></div>
-        <div class="sb-c"><div class="v" id="mElapsed">0s</div><div class="l">wall clock</div></div>
       </div>
       <div class="note" id="note">waiting for an order…</div>
     </div>
@@ -166,11 +173,22 @@ const fmt = (n) => (n || 0).toLocaleString("en-US");
 let lastSeq = -1;
 
 function renderBoard(board, activeStep) {
-  $("pConns").textContent = board.conns + (board.conns === 1 ? " phone" : " phones");
-
+  // When the board is unreachable we know nothing about phones or the floor.
+  // Showing "0 phones / floor closed" there states two things as fact that we
+  // have not actually observed.
+  const conns = $("pConns");
   const armed = $("pArmed");
-  armed.textContent = board.armed ? "floor open" : "floor closed";
-  armed.className = "pill" + (board.armed ? " on" : "");
+  if (!board.reachable) {
+    conns.textContent = "board offline";
+    conns.className = "pill bad";
+    armed.textContent = "—";
+    armed.className = "pill";
+  } else {
+    conns.textContent = board.conns + (board.conns === 1 ? " phone" : " phones");
+    conns.className = "pill";
+    armed.textContent = board.armed ? "floor open" : "floor closed";
+    armed.className = "pill" + (board.armed ? " on" : "");
+  }
 
   $("boardErr").textContent = board.error || (board.bus_healthy ? "" : "redis degraded");
 
@@ -185,14 +203,22 @@ function renderBoard(board, activeStep) {
          <div class="tug-legend"><b>${c.percent}% fixers</b><span>tipping point 50</span><b>${100 - c.percent}% breakers</b></div>`;
     const isActive = activeStep && c.name.toLowerCase().replace(/[^a-z]/g, "")
                       .includes(activeStep.toLowerCase().replace(/[^a-z]/g, "").slice(0, 6));
+    // "local" = read from our own chaos feed, because the board has no switch
+    // for it yet. Worth saying on screen so nobody assumes the room can tap it.
+    const src = c.source === "local"
+      ? '<span class="card-src local">not on the board yet</span>'
+      : (board.armed ? "" : '<span class="card-src">floor closed</span>');
     return `<div class="card ${down ? "down" : ""} ${isActive ? "active" : ""}">
       <div class="card-top">
         <span class="card-name">${c.name}</span>
         <span class="card-state">${down ? "DOWN" : "UP"}</span>
+        ${src}
         <span class="card-taps">${c.taps ? c.taps + " taps" : ""}</span>
       </div>${bar}
     </div>`;
-  }).join("") || '<div class="note">board reported no switches</div>';
+  }).join("") || `<div class="note">${
+      board.error ? board.error : "no components to show — set STAGE_COMPONENTS=all to show Ian's switches"
+    }</div>`;
 }
 
 function renderTimeline(events) {
@@ -212,7 +238,13 @@ function render(s) {
   if (s.seq === lastSeq) return;
   lastSeq = s.seq;
 
-  $("wf").textContent = s.workflow_id || "no order yet";
+  // Deliberately not the workflow id: several orders can be in flight at once,
+  // so naming one of them misleads. The count is the honest version.
+  const inFlight = s.orders_in_flight || 0;
+  $("wf").textContent = inFlight
+    ? `${inFlight} order${inFlight === 1 ? "" : "s"} in flight`
+    : "";
+
   renderBoard(s.board, s.order && s.order.step);
   renderTimeline(s.timeline);
 
@@ -223,16 +255,21 @@ function render(s) {
   else if (o.running) { st.textContent = o.step || o.status || "running"; st.className = "pill run"; }
   else { st.textContent = "idle"; st.className = "pill"; }
 
-  const b = s.scoreboard;
-  $("mTok").textContent = fmt(b.tokens_not_respent);
-  $("mHist").textContent = b.calls_served_from_history;
-  $("mDeaths").textContent = b.worker_deaths;
-  $("mAtt").textContent = fmt(b.downstream_attempts);
-  $("mTurns").textContent = b.turns;
-  $("mCalls").textContent = b.tool_calls;
-  $("mElapsed").textContent = Math.round(s.elapsed) + "s";
+  // ?? 0 rather than the raw value: a missing key renders as an empty tile,
+  // which looks like a layout bug rather than a count of zero. Zero is a real
+  // and correct reading before the first order lands.
+  const b = s.scoreboard || {};
+  $("mOrders").textContent = b.orders_completed ?? 0;
+  $("mDeaths").textContent = b.worker_deaths ?? 0;
+  $("mTurns").textContent = b.turns ?? 0;
+  $("mCalls").textContent = b.tool_calls ?? 0;
 
+  // The detail line carries everything that isn't a headline tile. Numbers
+  // only appear once they're non-zero, so it stays short until chaos starts.
   const parts = [`${fmt(b.tokens_spent)} tokens spent`, `${fmt(b.cache_read_tokens)} cached`];
+  if (b.tokens_not_respent) parts.push(`${fmt(b.tokens_not_respent)} not re-spent`);
+  if (b.calls_served_from_history) parts.push(`${b.calls_served_from_history} calls from history`);
+  if (b.downstream_attempts) parts.push(`${fmt(b.downstream_attempts)}s of outage absorbed`);
   if (b.reissued_calls) parts.push(`${b.reissued_calls} re-issued call(s) attached, not duplicated`);
   if (o.tools_available && o.tools_available.length) {
     parts.push(`tools: ${o.tools_available.join(", ")}`);

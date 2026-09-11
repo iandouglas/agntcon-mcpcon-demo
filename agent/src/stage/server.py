@@ -35,9 +35,21 @@ _task: asyncio.Task | None = None
 _follow_task: asyncio.Task | None = None
 
 
-async def _latest_workflow_id(client) -> str | None:
-    """Most recent TacoOrderAgent execution, running or not."""
-    query = f'WorkflowType = "TacoOrderAgent" AND TaskQueue = "{TASK_QUEUE}"'
+async def _running_workflow_id(client) -> str | None:
+    """The newest RUNNING TacoOrderAgent execution, or None.
+
+    Deliberately ignores closed executions. Adopting the most recent one of
+    those meant the screen booted showing a finished rehearsal order — four
+    turns, a full scoreboard, no workflow in sight — which is exactly the
+    confusing state you do not want on a projector before you have started.
+
+    An order that finishes *while we are watching* stays on screen, because we
+    keep following it; we just never adopt a stale one on startup.
+    """
+    query = (
+        f'WorkflowType = "TacoOrderAgent" AND TaskQueue = "{TASK_QUEUE}" '
+        'AND ExecutionStatus = "Running"'
+    )
     try:
         async for execution in client.list_workflows(query):
             return execution.id
@@ -47,14 +59,14 @@ async def _latest_workflow_id(client) -> str | None:
 
 
 async def _auto_follow(client) -> None:
-    """Switch to a newer order when one appears, so the screen never goes stale."""
+    """Adopt a new order the moment one starts, so nothing needs clicking."""
     while True:
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.5)
         if _collector is None:
             continue
-        latest = await _latest_workflow_id(client)
-        if latest and latest != _collector._workflow_id:  # noqa: SLF001
-            _collector.set_workflow(latest)
+        running = await _running_workflow_id(client)
+        if running and running != _collector.workflow_id:
+            _collector.set_workflow(running)
 
 
 app = FastAPI(title="Chaos Kitchen — stage screen")
@@ -66,7 +78,7 @@ async def startup() -> None:
     client = await connect()
     _collector = Collector(
         client,
-        await _latest_workflow_id(client),
+        await _running_workflow_id(client),
         BOARD_URL,
         BOARD_ADMIN_TOKEN,
     )

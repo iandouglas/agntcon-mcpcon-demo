@@ -36,6 +36,11 @@ class Component:
     percent: int | None = None
     taps: int = 0
     kind: str = "api"
+    # "board" = one of Ian's switches, reachable by the audience once the floor
+    # is armed. "local" = read from our own chaos feed because the board has no
+    # switch for it yet (the agent worker). Rendered as a tag so nobody mistakes
+    # a local-only component for something the room can touch.
+    source: str = "board"
 
 
 @dataclass
