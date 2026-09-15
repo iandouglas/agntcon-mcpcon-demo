@@ -10,6 +10,10 @@ call is itself a Temporal workflow.
 One component in the whole demo genuinely dies — our agent worker. Everything of
 Ian's degrades instead: a Redis flag makes calls 503 and Temporal absorbs them.
 
+> **Picking this up from the other side of the integration?** Start with
+> [`INTEGRATION.md`](INTEGRATION.md) — the contracts we consume, what we
+> guarantee back, and which lines are load-bearing. This README is the run-book.
+
 ## Layout
 
 | Path | Owner | What it is |
