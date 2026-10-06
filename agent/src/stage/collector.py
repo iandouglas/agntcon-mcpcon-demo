@@ -112,6 +112,11 @@ class Collector:
         self._last_step = ""
         self._last_switches: dict[str, bool] = {}
         self._seq = 0
+        # Set when the followed workflow turns out to be closed rather than
+        # orphaned by a dead worker. Without it `following_live` would stay
+        # true forever on an order that failed or was terminated, and the
+        # screen would sit on a corpse while the room watched nothing happen.
+        self._following_closed = False
         # Separate flag, NOT a field on self._order — that dict is rebuilt from
         # the query every tick, so a marker written into it is wiped on the
         # next pass and the completion event re-fires twice a second forever.
@@ -131,6 +136,18 @@ class Collector:
     def workflow_id(self) -> str | None:
         return self._workflow_id
 
+    @property
+    def following_live(self) -> bool:
+        """True while the order on screen is still worth watching.
+
+        A dead worker counts as live on purpose: the order is still open, and
+        jumping to a different one at the exact moment the room lands its kill
+        would skip the replay we are there to show.
+        """
+        if not self._workflow_id or self._following_closed:
+            return False
+        return not self._order.get("finished", False)
+
     def set_workflow(self, workflow_id: str) -> None:
         """Follow a different order.
 
@@ -144,6 +161,7 @@ class Collector:
         would erase the tally the audience has been building.
         """
         self._workflow_id = workflow_id
+        self._following_closed = False
         carried = {
             "orders_completed": self._score.orders_completed,
             "worker_deaths": self._score.worker_deaths,
@@ -314,7 +332,12 @@ class Collector:
             # put a fake death on the scoreboard at the end of every clean run.
             if self._worker_up and not self._order.get("finished"):
                 closed = await self._workflow_closed(handle)
-                if not closed:
+                if closed:
+                    # Closed, but never reported `finished` through the query —
+                    # failed, terminated, or timed out. Release it so
+                    # `_auto_follow` can pick up the next order.
+                    self._following_closed = True
+                else:
                     self._worker_up = False
                     self._score.worker_deaths += 1
                     self._score.tokens_not_respent += self._score.tokens_spent
