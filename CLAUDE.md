@@ -34,17 +34,19 @@ guessing, and prefer his dev notes over anything written here:
 - `iandouglas/temporal-agntcon-audience` — the audience board (TypeScript)
 - `iandouglas/temporal-agntcon-testdemo` — admin panel
 
-Everything of his is deployed on Railway, including **his own self-hosted
-Temporal** (with Postgres and a temporal-ui service) — not Temporal Cloud,
-whatever his MCP README and `.env.example` say. We run Temporal locally for now,
-so there are **two clusters and two UIs**; when something looks missing, check
-you're looking at the right one. Pointing our worker at his Railway Temporal is
-a deliberate later step.
+Everything is deployed on Railway, including **his own self-hosted Temporal**
+(with Postgres and a temporal-ui service) — not Temporal Cloud, whatever his MCP
+README and `.env.example` say. **Our worker and stage screen now run there too**,
+on his cluster, on our own task queue `richards-agent`. See `DEPLOY.md`.
+
+Locally you still get a second cluster and a second UI from
+`temporal server start-dev`, so when something looks missing, check you are
+looking at the right one.
 
 His services all run 2 replicas and his chaos is purely Redis flags, so **no
 process of his ever dies**. Our agent worker is the only component in the demo
-that actually crashes — which is why the `agent_worker` switch matters and is
-worth framing to him that way.
+that actually crashes — and it is now a real switch on his board, with a public
+`/chaos` feed the watchdog and `run_worker.sh` read. The room can kill us.
 
 ## Commands
 
@@ -213,9 +215,9 @@ They are unrelated and both are needed:
 
 - **Ian's rehearsal console** opens the floor — his switches go from inert to
   live. Nothing the audience taps registers before that.
-- **`scripts/order_stream.py`** starts orders flowing. This is ours; he has no
-  way to start a `TacoOrderAgent`, and won't until we point at his Railway
-  Temporal.
+- **`scripts/order_stream.py`** starts orders flowing. This is ours, and it is
+  now reachable to him too: we share his Temporal cluster, so anything that can
+  talk to it can start a `TacoOrderAgent` on the `richards-agent` task queue.
 
 ## Not built yet
 
