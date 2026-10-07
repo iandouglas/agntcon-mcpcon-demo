@@ -206,6 +206,13 @@ Two things in it are load-bearing:
   that happened, not a hypothetical naive agent.
   `collector.py` also distinguishes a closed workflow from a dead worker, so a
   clean finish doesn't log a fake death at the end of every run.
+- **`orders.py` submits a batch in the background, never inline.** A thousand
+  orders is a thousand RPCs; holding the HTTP response open for them reads as
+  a hung button. It also only ever runs one batch at a time, and `stop()`
+  cancels the *remaining* submissions — orders already started are left alone,
+  because they are durable and killing them to tidy up undoes the claim.
+  Relatedly, `_auto_follow` adopts a new order only when the current one is
+  closed: with hundreds in flight it used to re-target twice a second.
 
 ## Two different "start the demo" buttons
 
@@ -213,9 +220,12 @@ They are unrelated and both are needed:
 
 - **Ian's rehearsal console** opens the floor — his switches go from inert to
   live. Nothing the audience taps registers before that.
-- **`scripts/order_stream.py`** starts orders flowing. This is ours; he has no
-  way to start a `TacoOrderAgent`, and won't until we point at his Railway
-  Temporal.
+- **The stage screen's order control** starts orders flowing: a count and a
+  button in the header. The count is that many *separate* orders, not one
+  order of that size, and the big numbers are meant to outrun the worker so
+  the queued-vs-fulfilled gap is visible from the back of the room.
+  `scripts/order_stream.py` does the same job from a terminal, paced and
+  capped, which is still the better tool for a rehearsal you leave running.
 
 ## Not built yet
 

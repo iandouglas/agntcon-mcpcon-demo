@@ -49,6 +49,24 @@
   .pill.bad{color:var(--broken);border-color:var(--broken-dim);background:var(--broken-dim)}
   .pill.rep{color:var(--replay);border-color:var(--replay);background:var(--replay-dim)}
 
+  /* ---------- order controls ---------- */
+  .ord{display:flex;align-items:center;gap:7px}
+  .ord select,.ord button{
+    font-family:var(--mono);font-size:11px;letter-spacing:.04em;
+    padding:5px 10px;border-radius:4px;border:1px solid var(--rule);
+    background:var(--panel-2);color:var(--text);cursor:pointer;
+  }
+  .ord button.go{background:var(--masa-dim);border-color:var(--masa-dim);color:var(--masa)}
+  .ord button.go:hover:not(:disabled){border-color:var(--masa)}
+  .ord button.stop{background:var(--broken-dim);border-color:var(--broken-dim);color:var(--broken)}
+  .ord button:disabled{opacity:.45;cursor:default}
+  /* Clamped: a failed batch reports why, and a Temporal error is long enough
+     to shove the status pills off the end of the header if it is allowed to. */
+  .ord .prog{
+    font-family:var(--mono);font-size:10px;color:var(--text-faint);
+    max-width:230px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+
   /* ---------- two panes ---------- */
   main{flex:1;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);min-height:0}
   .pane{padding:16px 20px;min-height:0;display:flex;flex-direction:column}
@@ -114,7 +132,7 @@
 
   /* ---------- scoreboard ---------- */
   .sb{margin-top:14px;border-top:1px solid var(--rule);padding-top:12px}
-  .sb-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--rule-soft);border-radius:5px;overflow:hidden}
+  .sb-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--rule-soft);border-radius:5px;overflow:hidden}
   /* Fixed value height: an empty .v used to collapse and drag its label up,
      which reads as broken padding on one tile while the others look fine. */
   .sb-c{background:var(--panel);padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-start}
@@ -136,6 +154,22 @@
   <div class="brand">MISE EN <span>PANIC</span></div>
   <div class="wf" id="wf"></div>
   <div class="spacer"></div>
+  <div class="ord">
+    <!-- Each option is that many SEPARATE orders, not one order of that size.
+         The big numbers are meant to outrun the worker: the gap between queued
+         and fulfilled is the thing worth looking at. -->
+    <select id="oCount" aria-label="how many orders to place">
+      <option value="1">1 order</option>
+      <option value="10">10 orders</option>
+      <option value="30" selected>30 orders</option>
+      <option value="100">100 orders</option>
+      <option value="500">500 orders</option>
+      <option value="1000">1000 orders</option>
+    </select>
+    <button class="go" id="oGo">Place orders</button>
+    <button class="stop" id="oStop" hidden>Stop</button>
+    <span class="prog" id="oProg"></span>
+  </div>
   <div class="pill" id="pConns">board offline</div>
   <div class="pill" id="pArmed">—</div>
   <div class="pill" id="pStatus">idle</div>
@@ -156,7 +190,8 @@
 
     <div class="sb">
       <div class="sb-grid">
-        <div class="sb-c good"><div class="v" id="mOrders">0</div><div class="l">orders completed</div></div>
+        <div class="sb-c good"><div class="v" id="mOrders">0</div><div class="l">orders fulfilled</div></div>
+        <div class="sb-c rep"><div class="v" id="mQueued">0</div><div class="l">still in the queue</div></div>
         <div class="sb-c hit"><div class="v" id="mDeaths">0</div><div class="l">worker deaths survived</div></div>
         <div class="sb-c"><div class="v" id="mTurns">0</div><div class="l">model turns / <span id="mCalls">0</span> tool calls</div></div>
       </div>
@@ -171,6 +206,59 @@ const $ = (id) => document.getElementById(id);
 const fmt = (n) => (n || 0).toLocaleString("en-US");
 
 let lastSeq = -1;
+
+// ---------- placing orders ----------
+// The button is driven by the snapshot rather than by its own click, so two
+// browsers pointed at the same screen agree about whether a batch is running.
+function renderLauncher(l) {
+  const busy = !!l.submitting;
+  $("oGo").disabled = busy;
+  $("oStop").hidden = !busy;
+
+  let text = "";
+  if (busy) {
+    text = `queueing ${fmt(l.started)}/${fmt(l.target)}${l.stopping ? " · stopping" : ""}`;
+  } else if (l.error) {
+    text = l.error;
+  } else if (l.target) {
+    text = `queued ${fmt(l.started)}${l.failed ? ` · ${fmt(l.failed)} failed` : ""}`;
+  }
+  const prog = $("oProg");
+  prog.textContent = text;
+  prog.title = text;          // the clamped version is unreadable on an error
+}
+
+async function post(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  return { ok: res.ok, status: res.status, body: await res.json().catch(() => ({})) };
+}
+
+async function placeOrders() {
+  const count = parseInt($("oCount").value, 10);
+  $("oGo").disabled = true;
+  try {
+    const r = await post("/api/orders", { count });
+    // 409 means a batch is already going; its progress is in the body, so the
+    // snapshot shape renders either way.
+    if (r.ok) renderLauncher(r.body);
+    else renderLauncher({ ...r.body, error: r.body.error || `HTTP ${r.status}` });
+  } catch (_) {
+    // The next snapshot can't correct this one: if the POST never landed the
+    // server has nothing to report, so say so here or the button just sticks.
+    renderLauncher({ error: "could not reach the stage server" });
+  }
+}
+
+async function stopOrders() {
+  try { renderLauncher((await post("/api/orders/stop")).body); } catch (_) {}
+}
+
+$("oGo").addEventListener("click", placeOrders);
+$("oStop").addEventListener("click", stopOrders);
 
 function renderBoard(board, activeStep) {
   // When the board is unreachable we know nothing about phones or the floor.
@@ -247,6 +335,7 @@ function render(s) {
 
   renderBoard(s.board, s.order && s.order.step);
   renderTimeline(s.timeline);
+  renderLauncher(s.launcher || {});
 
   const st = $("pStatus");
   const o = s.order || {};
@@ -260,6 +349,9 @@ function render(s) {
   // and correct reading before the first order lands.
   const b = s.scoreboard || {};
   $("mOrders").textContent = b.orders_completed ?? 0;
+  // Running executions, which during a batch is the backlog the room is
+  // watching drain — the other half of the ordered-vs-fulfilled pair.
+  $("mQueued").textContent = inFlight;
   $("mDeaths").textContent = b.worker_deaths ?? 0;
   $("mTurns").textContent = b.turns ?? 0;
   $("mCalls").textContent = b.tool_calls ?? 0;
