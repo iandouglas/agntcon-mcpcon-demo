@@ -2,13 +2,13 @@
 
 Both of our pieces run in Ian's `agentcon-demo` Railway project, alongside his
 MCP server, mock services, audience board and self-hosted Temporal. One image,
-two services, different start commands — the same shape his MCP server uses, so
+two services, different start commands. Same shape his MCP server uses, so
 there is one thing to debug at 9am rather than two.
 
 | Service | Start command | Public domain |
 |---|---|---|
-| `agent-worker` | `./scripts/run_worker.sh` | no — outbound only |
-| `stage-screen` | `./scripts/run_stage.sh` | yes — the projector view |
+| `agent-worker` | `./scripts/run_worker.sh` | none, outbound only |
+| `stage-screen` | `./scripts/run_stage.sh` | yes, the projector view |
 
 Both build from `agent/Dockerfile` with **Root Directory `agent`**.
 
@@ -29,7 +29,7 @@ Railway's `$PORT`.
 ## Environment
 
 Everything is reachable over Railway's private network, so none of this traffic
-leaves the project. Private addresses need an explicit port — `.railway.internal`
+leaves the project. Private addresses need an explicit port; `.railway.internal`
 has no default.
 
 ### Shared with Ian's services
@@ -44,7 +44,7 @@ the talk and there should be one place to do it.
 
 We run on his Temporal cluster but on **our own task queue**, `richards-agent`
 (hardcoded in `shared.py`). His `temporal_task_queue` shared variable is
-`durable-mcp` and is not ours — do not set it here.
+`durable-mcp` and is not ours; do not set it here.
 
 ### `agent-worker`
 
@@ -59,7 +59,7 @@ We run on his Temporal cluster but on **our own task queue**, `richards-agent`
 
 Going over the private network to the MCP server also drops Railway's 15-minute
 edge cap, which is the one hard ceiling above our 960s read timeout. The four
-protocol traps in `mcp_client.py` still apply — they are about his server, not
+protocol traps in `mcp_client.py` still apply; they are about his server, not
 about the proxy.
 
 `WORKER_FORCE_REVIVE_SECONDS` is a rehearsal escape hatch that revives the
@@ -73,7 +73,7 @@ decision away from the room.
 | `BOARD_URL` | `http://audience-site.railway.internal:8080` | origin, not a websocket URL |
 | `BOARD_ADMIN_TOKEN` | `${{shared.admin_token}}` | the board rejects an unauthenticated read |
 | `STAGE_COMPONENTS` | `all` | without this the screen shows only `agent_worker` |
-| `PORT` | *(Railway sets it)* | — |
+| `PORT` | *(Railway sets it)* |; |
 
 `STAGE_COMPONENTS` defaults to `agent_worker` alone, which was right while his
 five switches were permanently UP and therefore noise. They are live now, so the
@@ -89,7 +89,7 @@ live board and a real Temporal:
 --- agent_worker at 0% · waiting for a fixer to cross 50% ---
 --- revived after 10s down ---
 --- worker generation 1 starting ---
-agent_worker at 33% — below 50%, the breakers won. exiting hard
+agent_worker at 33%; below 50%, the breakers won. exiting hard
 --- worker died (exit 1) ---
 --- agent_worker at 33% · waiting for a fixer to cross 50% ---
 ```
@@ -102,5 +102,5 @@ agent_worker at 33% — below 50%, the breakers won. exiting hard
   are plainly finishing, look for `order count query failed` in the logs rather
   than assuming the demo is broken.
 - `agent-worker`'s logs say `watchdog armed`. If they say
-  `CHAOS_URL unset — watchdog DISABLED`, the room cannot kill it.
+  `CHAOS_URL unset; watchdog DISABLED`, the room cannot kill it.
 - Start an order and watch it land on the stage screen.

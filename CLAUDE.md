@@ -35,7 +35,7 @@ guessing, and prefer his dev notes over anything written here:
 - `iandouglas/temporal-agntcon-testdemo` — admin panel
 
 Everything is deployed on Railway, including **his own self-hosted Temporal**
-(with Postgres and a temporal-ui service) — not Temporal Cloud, whatever his MCP
+(with Postgres and a temporal-ui service), not Temporal Cloud, whatever his MCP
 README and `.env.example` say. **Our worker and stage screen now run there too**,
 on his cluster, on our own task queue `richards-agent`. See `DEPLOY.md`.
 
@@ -45,7 +45,7 @@ looking at the right one.
 
 His services all run 2 replicas and his chaos is purely Redis flags, so **no
 process of his ever dies**. Our agent worker is the only component in the demo
-that actually crashes — and it is now a real switch on his board, with a public
+that actually crashes, and it is now a real switch on his board, with a public
 `/chaos` feed the watchdog and `run_worker.sh` read. The room can kill us.
 
 ## Commands
@@ -208,6 +208,13 @@ Two things in it are load-bearing:
   that happened, not a hypothetical naive agent.
   `collector.py` also distinguishes a closed workflow from a dead worker, so a
   clean finish doesn't log a fake death at the end of every run.
+- **`orders.py` submits a batch in the background, never inline.** A thousand
+  orders is a thousand RPCs; holding the HTTP response open for them reads as
+  a hung button. It also only ever runs one batch at a time, and `stop()`
+  cancels the *remaining* submissions — orders already started are left alone,
+  because they are durable and killing them to tidy up undoes the claim.
+  Relatedly, `_auto_follow` adopts a new order only when the current one is
+  closed: with hundreds in flight it used to re-target twice a second.
 
 ## Two different "start the demo" buttons
 
@@ -215,9 +222,15 @@ They are unrelated and both are needed:
 
 - **Ian's rehearsal console** opens the floor — his switches go from inert to
   live. Nothing the audience taps registers before that.
-- **`scripts/order_stream.py`** starts orders flowing. This is ours, and it is
-  now reachable to him too: we share his Temporal cluster, so anything that can
-  talk to it can start a `TacoOrderAgent` on the `richards-agent` task queue.
+- **The stage screen's order control** starts orders flowing: a count and a
+  button in the header. The count is that many *separate* orders, not one
+  order of that size, and the big numbers are meant to outrun the worker so
+  the queued-vs-fulfilled gap is visible from the back of the room.
+  `scripts/order_stream.py` does the same job from a terminal, paced and
+  capped, which is still the better tool for a rehearsal you leave running.
+  Both are reachable to Ian now; we share his Temporal cluster, so anything
+  that can talk to it can start a `TacoOrderAgent` on the `richards-agent`
+  task queue.
 
 ## Not built yet
 
