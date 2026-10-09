@@ -111,10 +111,17 @@ async def llm_turn(payload: LlmTurnInput) -> LlmTurn:
     if config.THINKING == "off":
         extra["thinking"] = {"type": "disabled"}
 
+    # Haiku 4.5 rejects `effort` with a 400 rather than ignoring it, so the
+    # parameter has to be absent and not merely unset. Sending it anyway fails
+    # every order, and because the failure is classified non-retryable it fails
+    # them instantly, which on stage looks like the whole demo collapsing.
+    effort = config.effort_for(config.MODEL)
+    if effort is not None:
+        extra["output_config"] = {"effort": effort}
+
     request = client.messages.create(
         model=config.MODEL,
         max_tokens=config.MAX_TOKENS,
-        output_config={"effort": config.EFFORT},
         **extra,
         # System prompt and tool list are byte-stable across every turn of
         # every order, so they cache. Volatile content (the conversation)
