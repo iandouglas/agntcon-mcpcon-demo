@@ -36,7 +36,28 @@ MODEL = os.getenv("AGENT_MODEL", "claude-opus-5")
 MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
 
 # Simple, well-specified tool loop — low effort keeps turns fast.
+# "off" omits the parameter entirely, which is also what happens automatically
+# on a model that does not accept it (see EFFORT_UNSUPPORTED).
 EFFORT = os.getenv("AGENT_EFFORT", "low")
+
+# Models that reject `output_config.effort` with a 400 rather than ignoring it.
+# Haiku 4.5 and Sonnet 4.5 predate the parameter; the Opus 5 and Sonnet 5
+# generation all accept it.
+#
+# This is a list and not an AGENT_EFFORT=off instruction in DEPLOY.md because
+# switching the model is one variable and nobody remembers that it is secretly
+# two. Getting it wrong fails every single order with a 400, which is a bad
+# thing to discover on stage.
+EFFORT_UNSUPPORTED = ("claude-haiku-4-5", "claude-sonnet-4-5")
+
+
+def effort_for(model: str) -> str | None:
+    """The effort to send for `model`, or None to omit the parameter."""
+    if EFFORT.lower() in ("off", "none", ""):
+        return None
+    if model.startswith(EFFORT_UNSUPPORTED):
+        return None
+    return EFFORT
 
 # "off" disables thinking entirely. Worth A/B-ing with a stopwatch before the
 # talk: thinking makes the out-of-stock re-plan more reliable, but it is also

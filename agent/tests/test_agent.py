@@ -15,6 +15,7 @@ from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+from richards_agent import config
 from richards_agent.mcp_client import McpInfrastructureError
 from richards_agent.shared import (
     AgentState,
@@ -198,3 +199,28 @@ async def test_idempotency_key_is_stable_across_retries():
     assert len(harness.keys_seen) == 4
     assert len(set(harness.keys_seen)) == 1, harness.keys_seen
     assert harness.keys_seen[0].endswith("-t0-c0")
+
+
+# --- effort, per model ----------------------------------------------------
+#
+# `output_config.effort` is not universally supported. Haiku 4.5 returns a 400
+# for it, and activities.py classifies a 400 as non-retryable, so sending it to
+# the wrong model fails every order the instant it starts. These pin the
+# decision so a model switch stays one variable.
+
+def test_effort_is_sent_to_a_model_that_takes_it():
+    assert config.effort_for("claude-opus-5") == config.EFFORT
+
+
+def test_effort_is_omitted_for_haiku():
+    assert config.effort_for("claude-haiku-4-5") is None
+
+
+def test_effort_is_omitted_for_a_dated_haiku_id():
+    """A pinned snapshot id must be recognised too, not just the bare alias."""
+    assert config.effort_for("claude-haiku-4-5-20251001") is None
+
+
+def test_effort_can_be_turned_off_by_hand(monkeypatch):
+    monkeypatch.setattr(config, "EFFORT", "off")
+    assert config.effort_for("claude-opus-5") is None
