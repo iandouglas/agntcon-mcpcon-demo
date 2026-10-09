@@ -8,11 +8,18 @@ picks the top of the dropdown.
 from __future__ import annotations
 
 import asyncio
+import random
 
 import pytest
 
 from stage.collector import Collector
-from stage.orders import EARLY_BAIL_FAILURES, LauncherBusy, OrderLauncher
+from stage.orders import (
+    EARLY_BAIL_FAILURES,
+    MAX_BURST,
+    MIN_BURST,
+    LauncherBusy,
+    OrderLauncher,
+)
 
 
 class FakeClient:
@@ -184,3 +191,103 @@ def test_following_a_new_order_clears_the_closed_flag():
     c._following_closed = True
     c.set_workflow("taco-order-2")
     assert c.following_live is True
+
+
+# ------------------------------------------------------------------- bursts
+#
+# Orders go out in bursts of a random size rather than at a steady 25. The
+# steady rate drew a straight line down the "still in the queue" tile, which
+# reads as a progress bar rather than a rush. What these pin is that making it
+# uneven did not make it lossy.
+
+
+class BurstRecordingClient(FakeClient):
+    """Records how many starts were in flight at once, per burst."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_flight = 0
+        self.peak = 0
+        self.bursts: list[int] = []
+
+    async def start_workflow(self, run, arg, *, id, task_queue):  # noqa: A002
+        if self.in_flight == 0:
+            self.bursts.append(0)
+        self.in_flight += 1
+        self.bursts[-1] += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0)  # let the rest of the burst start too
+            return await super().start_workflow(run, arg, id=id, task_queue=task_queue)
+        finally:
+            self.in_flight -= 1
+
+
+async def test_every_order_is_still_submitted_exactly_once():
+    """The burst arithmetic is off-by-one bait: 1000 means 1000, no gaps."""
+    client = FakeClient()
+    launcher = OrderLauncher(client, rng=random.Random(7))
+
+    launcher.submit(1000)
+    await drain(launcher, timeout=30.0)
+
+    assert len(client.started) == 1000
+    assert len(set(client.started)) == 1000
+    # Contiguous 1..1000, so no burst was skipped and none overlapped.
+    suffixes = sorted(int(i.rsplit("-", 1)[1]) for i in client.started)
+    assert suffixes == list(range(1, 1001))
+
+
+async def test_a_burst_never_exceeds_the_ceiling():
+    client = BurstRecordingClient()
+    launcher = OrderLauncher(client, rng=random.Random(7))
+
+    launcher.submit(300)
+    await drain(launcher, timeout=30.0)
+
+    assert client.peak <= MAX_BURST, f"burst of {client.peak} exceeds {MAX_BURST}"
+
+
+async def test_burst_sizes_actually_vary():
+    """The launcher must not come out as a metronome.
+
+    Reads the bursts the launcher really produced, not numbers the test rolled
+    for itself -- an earlier version of this did the latter and passed happily
+    against a hardcoded burst of 25, which is the exact thing it exists to
+    catch. Distinct sizes rather than a pinned sequence, so reorganising the
+    arithmetic does not break it.
+    """
+    client = BurstRecordingClient()
+    launcher = OrderLauncher(client, rng=random.Random(11))
+
+    launcher.submit(400)
+    await drain(launcher, timeout=30.0)
+
+    assert sum(client.bursts) == 400
+    assert all(MIN_BURST <= b <= MAX_BURST for b in client.bursts), client.bursts
+    assert len(set(client.bursts)) > 5, f"only these burst sizes: {set(client.bursts)}"
+
+
+async def test_the_final_burst_does_not_overshoot():
+    """A batch smaller than one burst submits exactly that many."""
+    client = FakeClient()
+    launcher = OrderLauncher(client, rng=random.Random(3))
+
+    launcher.submit(2)
+    await drain(launcher)
+
+    assert len(client.started) == 2
+
+
+async def test_stop_lands_inside_the_batch_not_after_it():
+    """Stopping must not have to wait out all 1000 submissions."""
+    client = FakeClient()
+    launcher = OrderLauncher(client, rng=random.Random(5))
+
+    launcher.submit(1000)
+    await asyncio.sleep(0.05)
+    launcher.stop()
+    await drain(launcher, timeout=30.0)
+
+    assert len(client.started) < 1000, "stop did not cut the batch short"
+    assert launcher.progress()["submitting"] is False

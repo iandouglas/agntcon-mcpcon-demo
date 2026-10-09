@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 
 from richards_agent.shared import TASK_QUEUE, OrderRequest
@@ -37,9 +38,20 @@ DEFAULT_REQUEST = "Two chicken tacos and whatever today's special is, please."
 # stops reading as a button press and starts reading as a hang.
 MAX_BATCH = 1000
 
-# Concurrent start_workflow calls. Tuned for "fast enough that a 1000-order
-# batch lands inside a sentence" without opening a socket per order.
-CONCURRENCY = 25
+# Orders go out in bursts of a random size in this range, one burst at a time.
+# The ceiling is the old fixed concurrency and is what keeps a 1000-order batch
+# landing inside a sentence without opening a socket per order. The floor being
+# 1 is the point: a steady 25 drew a straight line down the "still in the
+# queue" tile, which reads as a progress bar. Uneven bursts read as a rush.
+MIN_BURST = 1
+MAX_BURST = 25
+
+# A short random pause between bursts. Without it the bursts land back to back
+# and the unevenness averages out before anyone can see it -- the batch is
+# submitted far faster than the workers drain it, so submission is the only
+# part of this the room can watch arrive. Kept small: at ~77 bursts for a
+# 1000-order batch this adds a handful of seconds, not a wait.
+MAX_BURST_PAUSE_SECONDS = 0.2
 
 # If the first handful all fail there is something wrong with Temporal, and
 # grinding through the remaining 990 to produce 990 identical errors helps
@@ -54,9 +66,17 @@ class LauncherBusy(RuntimeError):
 class OrderLauncher:
     """Starts batches of individual orders. One batch at a time."""
 
-    def __init__(self, client, request: str = DEFAULT_REQUEST) -> None:
+    def __init__(
+        self,
+        client,
+        request: str = DEFAULT_REQUEST,
+        rng: random.Random | None = None,
+    ) -> None:
         self._client = client
         self._request = request
+        # Injectable so a test can pin the burst sizes. Nothing here needs to
+        # be cryptographically anything; it needs to not look like a metronome.
+        self._rng = rng or random.Random()
         self._task: asyncio.Task | None = None
         self._target = 0
         self._started = 0
@@ -115,30 +135,43 @@ class OrderLauncher:
         # cannot begin while this one is in flight, and unique within the batch
         # because the index is appended.
         stamp = int(time.time() * 1000)
-        semaphore = asyncio.Semaphore(CONCURRENCY)
         log.info("submitting %d order(s), batch %s", count, stamp)
 
         async def start_one(index: int) -> None:
-            async with semaphore:
-                if self._stopping or self._bailing():
-                    return
-                order_id = f"{stamp}-{index}"
-                try:
-                    await self._client.start_workflow(
-                        TacoOrderAgent.run,
-                        OrderRequest(order_id=order_id, request=self._request),
-                        id=f"taco-order-{order_id}",
-                        task_queue=TASK_QUEUE,
-                    )
-                except Exception as exc:  # noqa: BLE001 - one bad start is not the batch
-                    self._failed += 1
-                    self._last_error = f"{type(exc).__name__}: {exc}"
-                    log.warning("order %s failed to start: %s", order_id, exc)
-                else:
-                    self._started += 1
+            if self._stopping or self._bailing():
+                return
+            order_id = f"{stamp}-{index}"
+            try:
+                await self._client.start_workflow(
+                    TacoOrderAgent.run,
+                    OrderRequest(order_id=order_id, request=self._request),
+                    id=f"taco-order-{order_id}",
+                    task_queue=TASK_QUEUE,
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad start is not the batch
+                self._failed += 1
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                log.warning("order %s failed to start: %s", order_id, exc)
+            else:
+                self._started += 1
 
         try:
-            await asyncio.gather(*(start_one(i + 1) for i in range(count)))
+            # One burst at a time, each a random size. `stop()` and the early
+            # bail are checked between bursts as well as inside start_one, so
+            # a stop lands within one burst rather than after the whole batch.
+            index = 1
+            while index <= count:
+                if self._stopping or self._bailing():
+                    break
+                burst = min(self._rng.randint(MIN_BURST, MAX_BURST), count - index + 1)
+                await asyncio.gather(
+                    *(start_one(i) for i in range(index, index + burst))
+                )
+                index += burst
+                if index <= count and MAX_BURST_PAUSE_SECONDS:
+                    await asyncio.sleep(
+                        self._rng.uniform(0, MAX_BURST_PAUSE_SECONDS)
+                    )
         except asyncio.CancelledError:
             raise
         finally:
