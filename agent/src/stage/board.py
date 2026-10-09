@@ -98,8 +98,16 @@ def parse(payload: dict) -> BoardState:
             )
         )
 
-    # mcp first, then service_1..N — the order the call path runs in.
-    components.sort(key=lambda c: (c.id != "mcp", c.id))
+    # Follow the board's own order, because that is the order the room sees on
+    # their phones. This used to pin mcp first, which was right when mcp was
+    # the head of the call path; agent_worker is now, and a projector that
+    # lists the switches in a different order than the audience is holding is
+    # a worse problem than any ordering we could pick for ourselves.
+    # `services` is the board's ordered list. Anything it does not carry sorts
+    # after it, by id, so a component we learn about some other way still
+    # lands somewhere stable rather than wherever the dict happened to put it.
+    rank = {s.get("id"): i for i, s in enumerate(payload.get("services") or [])}
+    components.sort(key=lambda c: (rank.get(c.id, len(rank)), c.id))
 
     bus = payload.get("bus") or {}
     return BoardState(

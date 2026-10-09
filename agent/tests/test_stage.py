@@ -53,7 +53,8 @@ def test_parses_the_live_boolean_shape():
     assert state.bus_healthy is True
     assert len(state.components) == 5
 
-    # mcp sorts first — the order the call path actually runs in.
+    # mcp first, because that is where the board's own `services` list puts it
+    # in this fixture. The screen follows the board rather than deciding.
     assert state.components[0].id == "mcp"
     assert state.components[0].name == "AGENT ↔ MCP SERVER"
     assert state.components[0].up is False
@@ -132,3 +133,61 @@ def test_unconfigured_board_says_so_rather_than_pretending():
     state = asyncio.run(go())
     assert state.reachable is False
     assert "not configured" in state.error
+
+
+# The board as it actually is since Ian's agent_worker switch shipped: the
+# worker heads the call path, then the MCP link, then the four services. The
+# room sees exactly this order on their phones.
+TODAYS_PAYLOAD = {
+    **LIVE_BOOLEAN_PAYLOAD,
+    "state": {"agent_worker": 50, "mcp": 50, "service_1": 50,
+              "service_2": 50, "service_3": 50, "service_4": 50},
+    "services": [
+        {"id": "agent_worker", "name": "AGENT WORKER", "kind": "worker"},
+        {"id": "mcp", "name": "MCP SERVER", "kind": "mcp"},
+        {"id": "service_1", "name": "Order Taco", "kind": "api"},
+        {"id": "service_2", "name": "Order Churro", "kind": "api"},
+        {"id": "service_3", "name": "Restock Inventory", "kind": "api"},
+        {"id": "service_4", "name": "Send Receipt", "kind": "api"},
+    ],
+}
+
+
+def test_the_screen_lists_components_in_the_boards_order():
+    """The projector must not contradict what the room is holding.
+
+    This used to pin mcp first, which put the worker second on the screen and
+    first on every phone. Nobody can follow a demo where the switch they just
+    tapped is in a different place on the big screen.
+    """
+    state = board.parse(TODAYS_PAYLOAD)
+
+    assert [c.id for c in state.components] == [
+        "agent_worker", "mcp", "service_1", "service_2", "service_3", "service_4",
+    ]
+    assert state.components[0].kind == "worker"
+
+
+def test_a_component_the_board_does_not_list_sorts_last_not_randomly():
+    """`state` can carry an id `services` does not.
+
+    It lands after everything ranked, by id, rather than wherever the dict
+    happened to put it — so the screen is at least stable between polls.
+    """
+    payload = {
+        **TODAYS_PAYLOAD,
+        "state": {"zzz_unknown": 50, "agent_worker": 50, "mcp": 50, "aaa_unknown": 50},
+    }
+    state = board.parse(payload)
+
+    assert [c.id for c in state.components] == [
+        "agent_worker", "mcp", "aaa_unknown", "zzz_unknown",
+    ]
+
+
+def test_order_survives_a_payload_with_no_services_list():
+    """No `services` key: fall back to a stable alphabetical order."""
+    payload = {"state": {"mcp": True, "agent_worker": True, "service_1": True}}
+    state = board.parse(payload)
+
+    assert [c.id for c in state.components] == ["agent_worker", "mcp", "service_1"]
