@@ -349,6 +349,11 @@ class Collector:
                     # failed, terminated, or timed out. Release it so
                     # `_auto_follow` can pick up the next order.
                     self._following_closed = True
+                    # Not "worker down". Pressing STOP ALL ORDERS lands here,
+                    # and a screen that answers it with "worker down" sends
+                    # you hunting a crash you caused on purpose.
+                    self._order = {**self._order, "running": False, "status": "order ended"}
+                    return
                 else:
                     self._worker_up = False
                     self._score.worker_deaths += 1
