@@ -14,15 +14,36 @@ from richards_agent.shared import AgentState
 from stage.collector import Collector
 
 
+class _Status:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _Description:
+    def __init__(self, status: str) -> None:
+        self.status = _Status(status)
+
+
 class _Handle:
-    def __init__(self, state: AgentState) -> None:
+    """Queries always succeed, which is the case the freeze lived in.
+
+    `describe` is counted, not forbidden. It used to raise on the grounds that
+    a working query meant the workflow was alive -- which is exactly the wrong
+    assumption: Temporal answers queries from the history of a CLOSED workflow
+    too, so a failed order keeps replying `finished=False` forever.
+    """
+
+    def __init__(self, state: AgentState, status: str = "RUNNING") -> None:
         self._state = state
+        self.status = status
+        self.describes = 0
 
     async def query(self, *_args, **_kwargs) -> AgentState:
         return self._state
 
-    async def describe(self):  # pragma: no cover - only hit on query failure
-        raise AssertionError("describe() should not be needed while queries work")
+    async def describe(self) -> _Description:
+        self.describes += 1
+        return _Description(self.status)
 
 
 class _Client:
@@ -33,10 +54,14 @@ class _Client:
         return self._handle
 
 
-def _collector(state: AgentState) -> Collector:
+def _collector(state: AgentState, status: str = "RUNNING") -> Collector:
     # Empty board config: board.fetch short-circuits, so these tests exercise
     # only the workflow-polling path.
-    return Collector(_Client(_Handle(state)), "taco-order-1", "", "")
+    return Collector(_Client(_Handle(state, status)), "taco-order-1", "", "")
+
+
+def _handle_of(collector: Collector) -> _Handle:
+    return collector._client.get_workflow_handle("taco-order-1")
 
 
 @pytest.mark.asyncio
@@ -171,3 +196,93 @@ async def test_cumulative_counts_survive_a_new_order():
     assert collector._score.turns == 0
     assert collector._score.tool_calls == 0
     assert collector._score.tokens_spent == 0
+
+
+# ------------------------------------------------- releasing a dead order
+#
+# The freeze these guard: the screen sat on an order that had failed ten hours
+# earlier, while twenty real orders ran to completion behind it. A query
+# against a closed workflow succeeds and replays its last state, so `finished`
+# stayed False and `following_live` stayed True forever. `_following_closed`
+# existed for this, but only the query-raised path ever set it.
+
+
+@pytest.mark.asyncio
+async def test_a_failed_order_releases_the_screen():
+    """The load-bearing one. Query works, says unfinished; the workflow is
+    over. Nothing here raises, so the old `except`-only guard never fired."""
+    state = AgentState(order_id="1", status="thinking", step="llm_turn 1")
+    collector = _collector(state, status="FAILED")
+
+    assert collector.following_live is True
+    await collector._poll_workflow()
+
+    assert collector.following_live is False, "auto-follow can never move on"
+    assert collector._following_closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_running_order_is_not_released():
+    """The other half: an order mid-flight must keep the screen."""
+    state = AgentState(order_id="1", status="thinking", step="llm_turn 1")
+    collector = _collector(state, status="RUNNING")
+
+    for _ in range(5):
+        collector._last_closed_check = 0.0
+        await collector._poll_workflow()
+
+    assert collector.following_live is True
+
+
+@pytest.mark.asyncio
+async def test_a_finished_order_never_costs_a_describe():
+    """It already said `finished`. Asking Temporal to confirm is pure cost."""
+    state = AgentState(
+        order_id="1", status="done", step="complete", finished=True, answer="done",
+    )
+    collector = _collector(state, status="COMPLETED")
+
+    for _ in range(5):
+        await collector._poll_workflow()
+
+    assert _handle_of(collector).describes == 0
+
+
+@pytest.mark.asyncio
+async def test_the_closed_check_is_throttled():
+    """Polling runs at 2Hz. One describe per poll would double the RPC load on
+    every healthy order to catch a case that is rare."""
+    state = AgentState(order_id="1", status="thinking", step="llm_turn 1")
+    collector = _collector(state, status="RUNNING")
+
+    for _ in range(20):
+        await collector._poll_workflow()
+
+    assert _handle_of(collector).describes == 1, "throttle is not holding"
+
+
+@pytest.mark.asyncio
+async def test_releasing_is_announced_once_not_at_the_poll_rate():
+    """Same bug class as the duplicate-completion one above."""
+    state = AgentState(order_id="1", status="thinking", step="llm_turn 1")
+    collector = _collector(state, status="FAILED")
+
+    for _ in range(20):
+        collector._last_closed_check = 0.0
+        await collector._poll_workflow()
+
+    ended = [e for e in collector._timeline if e.message == "order ended without finishing"]
+    assert len(ended) == 1, f"expected 1 event, got {len(ended)}"
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_order_is_given_a_grace_period():
+    """`set_workflow` arms the throttle, so adopting an order does not spend a
+    describe on a workflow that started milliseconds ago."""
+    state = AgentState(order_id="1", status="thinking", step="llm_turn 1")
+    collector = _collector(state, status="RUNNING")
+
+    collector.set_workflow("taco-order-2")
+    await collector._poll_workflow()
+
+    assert _handle_of(collector).describes == 0

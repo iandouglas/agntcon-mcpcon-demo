@@ -32,7 +32,21 @@ from richards_agent.workflow import TacoOrderAgent
 
 log = logging.getLogger(__name__)
 
-DEFAULT_REQUEST = "Two chicken tacos and whatever today's special is, please."
+# Names only tools the server actually has. The old text asked for "whatever
+# today's special is", but the deployed MCP server exposes order_taco,
+# order_churro, restock_inventory and send_receipt -- there is no way to look a
+# special up. The local fake has get_specials, production does not, so the gap
+# only shows against the real server.
+#
+# Opus papered over it by guessing the special was the churro. Haiku refuses to
+# guess and asks the customer instead, calling no tools at all: 6 of 8 sampled
+# orders made zero tool calls and still closed Completed, so the tiles counted
+# orders the MCP server was never told about. An order the agent cannot fill
+# without asking a question is not a demo of an agent filling orders.
+DEFAULT_REQUEST = (
+    "Two chicken tacos and a churro, please, "
+    "and send me a receipt when it is done."
+)
 
 # The dropdown's top entry. Past this the submission takes long enough that it
 # stops reading as a button press and starts reading as a hang.

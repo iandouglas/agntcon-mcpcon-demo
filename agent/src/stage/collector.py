@@ -40,6 +40,11 @@ log = logging.getLogger(__name__)
 # ago is still visible above the current one. Only the last ~24 render.
 MAX_TIMELINE = 200
 
+# How often to ask Temporal whether the order we are following is actually
+# still open. Only consulted while the query says the order is unfinished, so
+# a healthy order costs one extra RPC every few seconds and nothing else.
+CLOSED_CHECK_SECONDS = 5.0
+
 # Our own chaos feed. The audience board has no switch for the agent worker
 # yet, so its health is read from here instead.
 LOCAL_CHAOS_URL = os.getenv("CHAOS_URL", "http://localhost:8931/chaos")
@@ -117,6 +122,10 @@ class Collector:
         # true forever on an order that failed or was terminated, and the
         # screen would sit on a corpse while the room watched nothing happen.
         self._following_closed = False
+        # Throttle for the closed check below. Starts at 0.0 so the first
+        # unfinished poll checks immediately: on startup we adopt whatever
+        # visibility hands us, and that may already be a corpse.
+        self._last_closed_check = 0.0
         # Separate flag, NOT a field on self._order — that dict is rebuilt from
         # the query every tick, so a marker written into it is wiped on the
         # next pass and the completion event re-fires twice a second forever.
@@ -162,6 +171,9 @@ class Collector:
         """
         self._workflow_id = workflow_id
         self._following_closed = False
+        # A just-started order is not a corpse. Give it the full interval
+        # before spending a describe() on it.
+        self._last_closed_check = time.monotonic()
         carried = {
             "orders_completed": self._score.orders_completed,
             "worker_deaths": self._score.worker_deaths,
@@ -382,6 +394,45 @@ class Collector:
         if state.finished and not self._completion_logged:
             self._completion_logged = True
             self._push("info", "order complete", state.answer[:120])
+
+        if not state.finished:
+            await self._release_if_closed(handle)
+
+    async def _release_if_closed(self, handle) -> None:
+        """Let go of an order that is over but never said so.
+
+        A query against a CLOSED workflow succeeds: Temporal replays its
+        history and answers from it. So a failed order keeps returning its
+        last state, in which `finished` is False, and the only thing that ever
+        set `_following_closed` was the `except` branch above, which needs the
+        query to raise. It never does. The result was a screen stuck on a
+        workflow that died ten hours earlier while real orders came and went
+        behind it.
+
+        A dead worker is deliberately NOT caught here: there the query raises
+        and `_poll_workflow` handles it, which is what keeps the screen on the
+        order the room just killed instead of cutting away from the replay.
+        """
+        if self._following_closed:
+            # Already let go. `_auto_follow` adopts the next order when one
+            # starts; until then we keep showing this one's last state rather
+            # than re-announcing its death every few seconds.
+            return
+
+        now = time.monotonic()
+        if now - self._last_closed_check < CLOSED_CHECK_SECONDS:
+            return
+        self._last_closed_check = now
+
+        if not await self._workflow_closed(handle):
+            return
+
+        self._following_closed = True
+        self._push(
+            "crash",
+            "order ended without finishing",
+            self._workflow_id or "",
+        )
 
     async def _workflow_closed(self, handle) -> bool:
         """True if the workflow has finished — so a failing query is expected."""

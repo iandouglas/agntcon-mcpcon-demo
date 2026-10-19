@@ -33,7 +33,10 @@ from richards_agent.shared import TASK_QUEUE, OrderRequest  # noqa: E402
 from richards_agent.worker import connect  # noqa: E402
 from richards_agent.workflow import TacoOrderAgent  # noqa: E402
 
-DEFAULT_REQUEST = "Two chicken tacos and whatever today's special is, please."
+DEFAULT_REQUEST = (
+    "Two chicken tacos and a churro, please, "
+    "and send me a receipt when it is done."
+)
 
 
 async def counts(client, since: str) -> tuple[int, int]:
