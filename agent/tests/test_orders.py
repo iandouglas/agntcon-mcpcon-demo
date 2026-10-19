@@ -16,9 +16,12 @@ from stage.collector import Collector
 from stage.orders import (
     EARLY_BAIL_FAILURES,
     MAX_BURST,
+    MAX_ITEMS,
     MIN_BURST,
+    MIN_ITEMS,
     LauncherBusy,
     OrderLauncher,
+    compose_request,
 )
 
 
@@ -146,6 +149,94 @@ async def test_the_order_text_is_overridable():
     await drain(launcher)
 
     assert client.requests == ["One churro, extra cinnamon."] * 2
+
+
+# --------------------------------------------------------------- quantities
+#
+# The MCP tools take no arguments: order_taco means exactly one taco. So the
+# number in the text decides how many tool calls, MCP-side workflows and
+# downstream requests one order produces. A fixed quantity made every order
+# drive the identical four calls against the identical four tiles.
+
+import re  # noqa: E402
+
+
+def _counts(text: str) -> tuple[int, int]:
+    """Pull (tacos, churros) back out of an order's text."""
+    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+    taco = re.search(r"(\w+) chicken taco", text)
+    churro = re.search(r"and (\w+) churro", text)
+    assert taco and churro, f"unparseable order text: {text!r}"
+    return words[taco.group(1).lower()], words[churro.group(1).lower()]
+
+
+def test_quantities_stay_inside_the_advertised_range():
+    rng = random.Random(1)
+    for _ in range(300):
+        tacos, churros = _counts(compose_request(rng))
+        assert MIN_ITEMS <= tacos <= MAX_ITEMS, tacos
+        assert MIN_ITEMS <= churros <= MAX_ITEMS, churros
+
+
+def test_the_whole_range_is_actually_reachable():
+    """A roll that never produces 1 or never produces 5 would quietly narrow
+    the demo without failing anything."""
+    rng = random.Random(1)
+    seen_tacos, seen_churros = set(), set()
+    for _ in range(400):
+        tacos, churros = _counts(compose_request(rng))
+        seen_tacos.add(tacos)
+        seen_churros.add(churros)
+
+    expected = set(range(MIN_ITEMS, MAX_ITEMS + 1))
+    assert seen_tacos == expected, seen_tacos
+    assert seen_churros == expected, seen_churros
+
+
+def test_one_of_a_thing_is_not_plural():
+    """'One chicken tacos' would be read aloud off the Temporal UI on stage."""
+    class _Pinned:
+        def randint(self, _a, _b): return 1
+
+    text = compose_request(_Pinned())
+    assert "one chicken taco " in text.lower(), text
+    assert "tacos" not in text, text
+    assert "churros" not in text, text
+
+
+def test_the_receipt_is_always_asked_for():
+    """send_receipt is the last tile in the call path. An order that forgets to
+    ask for one leaves it dark."""
+    rng = random.Random(3)
+    for _ in range(50):
+        assert "receipt" in compose_request(rng)
+
+
+@pytest.mark.asyncio
+async def test_each_order_in_a_batch_gets_its_own_quantities():
+    """The point of the change. Submitting 40 orders that all say the same
+    thing is the behaviour this replaced."""
+    client = FakeClient()
+    launcher = OrderLauncher(client, rng=random.Random(5))
+
+    launcher.submit(40)
+    await drain(launcher)
+
+    assert len(client.requests) == 40
+    assert len(set(client.requests)) > 1, "every order asked for the same thing"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_request_still_pins_every_order():
+    """STAGE_ORDER_REQUEST exists so two runs can be made comparable. The
+    randomiser must not override it."""
+    client = FakeClient()
+    launcher = OrderLauncher(client, request="One churro, extra cinnamon.", rng=random.Random(5))
+
+    launcher.submit(10)
+    await drain(launcher)
+
+    assert set(client.requests) == {"One churro, extra cinnamon."}
 
 
 # ----------------------------------------------------------- following_live
