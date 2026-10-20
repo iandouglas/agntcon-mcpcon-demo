@@ -286,3 +286,50 @@ async def test_a_fresh_order_is_given_a_grace_period():
     await collector._poll_workflow()
 
     assert _handle_of(collector).describes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_closed_order_does_not_report_a_worker_that_is_fine():
+    """STOP ALL ORDERS terminates the followed workflow, which makes the query
+    raise. The old code answered every raise with "worker down", so pressing
+    the button told you the worker had crashed when you had simply stopped the
+    order -- and the worker is right there, still polling."""
+
+    class _Closed(_Handle):
+        async def query(self, *_args, **_kwargs):
+            raise RuntimeError("workflow is terminated")
+
+    collector = _collector(AgentState(order_id="1", status="thinking", step="llm_turn 1"))
+    handle = _Closed(AgentState(order_id="1"), status="TERMINATED")
+    collector._client = _Client(handle)
+
+    await collector._poll_workflow()
+
+    assert collector._order["status"] == "order ended"
+    assert collector._score.worker_deaths == 0, "nothing died; do not bank a death"
+    assert collector.following_live is False, "auto-follow must be free to move on"
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_dead_worker_still_says_so():
+    """The other half, and the one that matters on stage: when the workflow is
+    still open, a failing query really is a dead worker and must be scored."""
+
+    class _Unreachable(_Handle):
+        async def query(self, *_args, **_kwargs):
+            raise RuntimeError("no worker")
+
+        async def describe(self):
+            self.describes += 1
+            return _Description("RUNNING")
+
+    collector = _collector(AgentState(order_id="1", status="thinking", step="llm_turn 1"))
+    collector._client = _Client(_Unreachable(AgentState(order_id="1")))
+    collector._score.tokens_spent = 630
+
+    await collector._poll_workflow()
+
+    assert collector._order["status"] == "worker down"
+    assert collector._score.worker_deaths == 1
+    assert collector._score.tokens_not_respent == 630
+    assert collector.following_live is True, "do not cut away from the kill"

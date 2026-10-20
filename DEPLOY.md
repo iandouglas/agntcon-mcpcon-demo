@@ -73,7 +73,16 @@ decision away from the room.
 | `BOARD_URL` | `http://audience-site.railway.internal:8080` | origin, not a websocket URL |
 | `BOARD_ADMIN_TOKEN` | `${{shared.admin_token}}` | the board rejects an unauthenticated read |
 | `STAGE_COMPONENTS` | `all` | without this the screen shows only `agent_worker` |
+| `STAGE_ADMIN_TOKEN` | `${{shared.admin_token}}` | guards `POST /api/orders/terminate`; unset disables it |
 | `PORT` | *(Railway sets it)* |; |
+
+`STAGE_ADMIN_TOKEN` is the only authenticated thing on the stage screen. The
+rest of its API is open, which is fine for a screen you point at a projector,
+but `POST /api/orders/terminate` ends every running order and the service
+answers on a public hostname. Leave the variable unset and the endpoint returns
+503 rather than running: a teardown switch reachable by anyone who finds the URL
+is worse than one that is off. The control panel's STOP ALL ORDERS button is
+what calls it, so it needs the same value Ian's board uses.
 
 `STAGE_COMPONENTS` defaults to `agent_worker` alone, which was right while his
 five switches were permanently UP and therefore noise. They are live now, so the
