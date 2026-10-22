@@ -20,7 +20,7 @@ load-bearing enough that changing them breaks the talk.
 
 Not ours: the MCP server, the mock Go services, the audience board, the admin
 console. Your repos are the source of truth for every contract below — if this
-file and your `INTEGRATION-NOTES.md` disagree, yours wins and this one is stale.
+file and your repos disagree, yours win and this one is stale.
 
 **Setup and verification, start to finish:**
 
@@ -273,7 +273,7 @@ checked end to end. Run it after either side deploys, and again before the talk.
 ## 11. Reference
 
 - Your dev notes — https://github.com/iandouglas/temporal-agntcon-devnotes
-  (`notes-for-melissa.md` is the call sheet, `INTEGRATION-NOTES.md` the detail)
+  (how the repos fit together, and `RAILWAY.md` for deploying them)
 - `dejavu-tacos`, the pattern this borrows from —
   https://github.com/temporal-sa/demo-dejavu-tacos
 - Failure taxonomy, protocol traps, and stage-screen internals in more depth:

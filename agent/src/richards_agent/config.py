@@ -10,11 +10,9 @@ TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", "default")
 TEMPORAL_API_KEY = os.getenv("TEMPORAL_API_KEY")  # set for Temporal Cloud
 
 # --- Richard's MCP server -------------------------------------------------
-# Ian's deployed server. Override to http://localhost:8931/mcp to use the
-# local fake instead.
-MCP_ENDPOINT = os.getenv(
-    "MCP_ENDPOINT", "https://mcp-production-00c3d.up.railway.app/mcp"
-)
+# The local fake by default (`uvicorn fake_mcp.server:app --port 8931`).
+# Point it at a deployed temporal-agntcon-mcp server to run for real.
+MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "http://localhost:8931/mcp")
 # Required by the real server. Both tokens get rotated after the talk.
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")
 

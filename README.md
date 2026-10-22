@@ -33,8 +33,11 @@ uv run pytest tests/ -q          # 38 tests, no API key or network needed
 cp .env.example .env             # then fill it in
 ```
 
-`.env` needs `ANTHROPIC_API_KEY`, `MCP_AUTH_TOKEN` and `BOARD_ADMIN_TOKEN`.
-Current values live in `iandouglas/temporal-agntcon-devnotes/notes-for-melissa.md`.
+`.env` needs your own `ANTHROPIC_API_KEY`. To run against a deployed
+[temporal-agntcon-mcp](https://github.com/iandouglas/temporal-agntcon-mcp)
+server and [audience board](https://github.com/iandouglas/temporal-agntcon-audience)
+instead of the local fake, also set `MCP_ENDPOINT`, `MCP_AUTH_TOKEN`, `BOARD_URL`
+and `BOARD_ADMIN_TOKEN` to the values from your own deployment.
 
 ## Running the demo
 
@@ -63,7 +66,7 @@ backlog. That backlog is the demo's argument, and it's what makes "orders
 completed" a number worth projecting.
 
 Terminal 2 is only there because Ian's board tracks *his* services, not our
-agent worker. Its MCP side is unused while `MCP_ENDPOINT` points at Ian's
+agent worker. Its MCP side is unused once `MCP_ENDPOINT` points at Ian's
 server. Terminal 3 is supervised so a killed worker comes back — that restart
 is where replay happens, which is the whole demo.
 
@@ -72,8 +75,8 @@ is where replay happens, which is the whole demo.
 - **Just check the agent runs** — terminals 1, 3, 5.
 - **No API key, no network** — terminals 1 and 2, then
   `uv run python scripts/e2e_chaos.py` (the model turn is scripted).
-- **Ignore Ian's server entirely** — set `MCP_ENDPOINT=http://localhost:8931/mcp`.
-- **Check the live integration** — `uv run python scripts/probe_live.py`.
+- **Ignore Ian's server entirely** — leave `MCP_ENDPOINT` unset; it defaults to the local fake.
+- **Check the live integration** — set `MCP_ENDPOINT`, then `uv run python scripts/probe_live.py`.
 
 ### Two clusters, two UIs
 
@@ -99,10 +102,11 @@ breaking things.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `MCP_ENDPOINT` | Ian's Railway server | Set to `http://localhost:8931/mcp` for the local fake |
+| `MCP_ENDPOINT` | `http://localhost:8931/mcp` | The local fake. Set it to a deployed MCP server's `/mcp` URL to run for real |
 | `MCP_AUTH_TOKEN` | unset | **Required** by Ian's server; 401 without it |
-| `BOARD_URL` | Ian's audience board | Where the stage screen reads switch state |
+| `BOARD_URL` | unset | Origin of the audience board the stage screen reads switch state from |
 | `BOARD_ADMIN_TOKEN` | unset | Without it the stage screen's left pane greys out |
+| `STAGE_ADMIN_TOKEN` | unset | Once set, placing, stopping and terminating orders need it. Open the stage screen as `/?token=...` |
 | `AGENT_MODEL` | `claude-opus-5` | Latency untimed; switch to `claude-haiku-4-5` only after a stopwatch run |
 | `AGENT_THINKING` | `on` | `off` disables thinking — the biggest latency lever |
 | `TEMPORAL_ADDRESS` | `localhost:7233` | |
@@ -141,7 +145,9 @@ MCP server's tool names come from its own env vars.
 
 ## Design references
 
-- Ian's dev notes — https://github.com/iandouglas/temporal-agntcon-devnotes
-- Demo spec — https://claude.ai/code/artifact/3b1e83d6-24e1-478e-9c02-54116a7af236
-- Stage screen prototype (simulated, predates the real integration) — https://claude.ai/code/artifact/8d903f38-6e5c-4841-aeac-9f04fd8c0654
+- Ian's dev notes and the Railway guide — https://github.com/iandouglas/temporal-agntcon-devnotes
 - `dejavu-tacos`, the pattern this borrows from — https://github.com/temporal-sa/demo-dejavu-tacos
+
+## License
+
+[MIT](LICENSE)

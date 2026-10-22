@@ -27,8 +27,8 @@ Two people, five repos. Don't build across the line.
 Ian's repos are the source of truth for every contract. Read them rather than
 guessing, and prefer his dev notes over anything written here:
 
-- `iandouglas/temporal-agntcon-devnotes` — **start here**, `notes-for-melissa.md`
-  is the call sheet and `INTEGRATION-NOTES.md` the detail
+- `iandouglas/temporal-agntcon-devnotes` — **start here**: how the repos fit
+  together, the local stack, and `RAILWAY.md` for deploying all of it
 - `iandouglas/temporal-agntcon-mcp` — the MCP server (Python). `DESIGN.md` is good
 - `iandouglas/temporal-agntcon-service` — the mock services (Go)
 - `iandouglas/temporal-agntcon-audience` — the audience board (TypeScript)
@@ -71,8 +71,8 @@ cd agent && set -a && source .env && set +a
 | Be the audience | `uv run python scripts/audience.py kill agent_worker` |
 | Local chaos run, scripted model | `uv run python scripts/e2e_chaos.py` |
 
-`MCP_ENDPOINT` defaults to Ian's live server. Point it at
-`http://localhost:8931/mcp` to use the local fake instead.
+`MCP_ENDPOINT` defaults to the local fake at `http://localhost:8931/mcp`. Set
+it to Ian's deployed server's `/mcp` URL to run against the real thing.
 
 ## The four protocol traps
 
@@ -175,7 +175,7 @@ read as "order finished" until that was made a loud failure.
 
 ## Open decisions with Ian
 
-From `notes-for-melissa.md` §7 — these need a conversation, not a code change:
+These need a conversation, not a code change:
 
 - **Tools take zero arguments** and can't report business outcomes, so the agent
   calls four tools in order with no branch. A `for` loop would look identical,

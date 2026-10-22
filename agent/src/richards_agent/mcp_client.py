@@ -1,7 +1,7 @@
 """MCP client for Ian's durable MCP server.
 
-Written against the contract in `temporal-agntcon-devnotes/notes-for-melissa.md`
-and verified against the live server. Four things here are load-bearing; each
+Written against the contract in Ian's `temporal-agntcon-mcp` README and
+verified against the live server. Four things here are load-bearing; each
 one is silent in rehearsal and fatal the moment the audience breaks something.
 
 1. `MCP-Protocol-Version: 2026-07-28`. Omit it and the server routes us to the

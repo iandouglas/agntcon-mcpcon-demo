@@ -30,16 +30,21 @@ from .collector import Collector
 from .orders import MAX_BATCH, LauncherBusy, OrderLauncher
 from .teardown import terminate_running_orders
 
-BOARD_URL = os.getenv("BOARD_URL", "https://audience-site-production.up.railway.app")
+# No default board: point BOARD_URL at a deployed audience board to light up
+# the switch panel. Unset, the panel greys out and everything else still runs.
+BOARD_URL = os.getenv("BOARD_URL", "")
 BOARD_ADMIN_TOKEN = os.getenv("BOARD_ADMIN_TOKEN", "")
 SNAPSHOT_HZ = float(os.getenv("STAGE_SNAPSHOT_HZ", "5"))
 ORDER_REQUEST = os.getenv("STAGE_ORDER_REQUEST", "").strip()
 
-# Guards POST /api/orders/terminate, and nothing else. The rest of this API is
-# open because it is a screen you point at a projector, but that endpoint ends
-# running work and the service answers on a public hostname. Unset means the
-# endpoint is disabled rather than open: a teardown switch that defaults to
-# reachable by anyone who finds the URL is worse than one that is off.
+# Guards the endpoints that start, stop or end orders. The read side of this
+# API is open because it is a screen you point at a projector, but every order
+# spends model tokens and the service answers on a public hostname.
+#
+# Unset, placing and stopping orders stay open, which is what you want on
+# localhost. Terminate is the exception: unset means it is disabled rather
+# than open, because a teardown switch that defaults to reachable by anyone
+# who finds the URL is worse than one that is off.
 ADMIN_TOKEN = os.getenv("STAGE_ADMIN_TOKEN", "").strip()
 
 STATIC = pathlib.Path(__file__).parent / "static"
@@ -156,6 +161,8 @@ async def place_orders(request: Request) -> JSONResponse:
     of tacos on one order. Thirty means thirty orders the room can watch pile
     up, which is the whole reason this exists.
     """
+    if ADMIN_TOKEN and not _authorised(request):
+        return JSONResponse({"error": "unauthorised"}, status_code=401)
     if _launcher is None:
         return JSONResponse({"error": "launcher not started"}, status_code=503)
     try:
@@ -182,8 +189,10 @@ async def place_orders(request: Request) -> JSONResponse:
 
 
 @app.post("/api/orders/stop")
-async def stop_orders() -> JSONResponse:
+async def stop_orders(request: Request) -> JSONResponse:
     """Stop submitting the rest of the batch. Started orders are left alone."""
+    if ADMIN_TOKEN and not _authorised(request):
+        return JSONResponse({"error": "unauthorised"}, status_code=401)
     if _launcher is None:
         return JSONResponse({"error": "launcher not started"}, status_code=503)
     return JSONResponse(_launcher.stop())

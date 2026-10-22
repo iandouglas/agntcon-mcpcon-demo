@@ -281,3 +281,31 @@ async def test_it_says_when_a_batch_is_still_being_submitted(monkeypatch):
     response = await srv.terminate_orders(_Request(params={"token": "s3cret"}))
 
     assert _body(response)["submitting"] is True
+
+
+# ------------------------------------------------- placing and stopping orders
+# Every order spends model tokens, so once a token is configured these need it
+# too. Unset they stay open, which is what local work wants.
+
+
+@pytest.mark.asyncio
+async def test_placing_orders_needs_the_token_once_one_is_set(armed):
+    response = await srv.place_orders(_Request())
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_stopping_orders_needs_the_token_once_one_is_set(armed):
+    response = await srv.stop_orders(_Request())
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_with_no_token_set_placing_orders_is_not_gated(monkeypatch):
+    monkeypatch.setattr(srv, "ADMIN_TOKEN", "")
+    monkeypatch.setattr(srv, "_launcher", None)
+
+    response = await srv.place_orders(_Request())
+
+    # Past the auth check and on to "no launcher", rather than a 401.
+    assert response.status_code == 503
