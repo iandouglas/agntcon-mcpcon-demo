@@ -256,7 +256,11 @@ let lastSeq = -1;
 // ---------- placing orders ----------
 // The button is driven by the snapshot rather than by its own click, so two
 // browsers pointed at the same screen agree about whether a batch is running.
-function renderLauncher(l) {
+// The last running count from a snapshot, so a render straight off a button
+// click (which has no snapshot) still drains from the right number.
+let lastInFlight = 0;
+
+function renderLauncher(l, inFlight = lastInFlight) {
   const busy = !!l.submitting;
   $("oGo").disabled = busy;
   $("oStop").hidden = !busy;
@@ -267,7 +271,14 @@ function renderLauncher(l) {
   } else if (l.error) {
     text = l.error;
   } else if (l.target) {
-    text = `queued ${fmt(l.started)}${l.failed ? ` · ${fmt(l.failed)} failed` : ""}`;
+    // `started` is fixed once submission ends, so on its own it never drains.
+    // Count down with the running total instead, capped at the batch so orders
+    // from a terminal or an earlier batch don't inflate it.
+    const left = Math.min(inFlight, l.started);
+    text = left
+      ? `queued ${fmt(left)}/${fmt(l.started)}`
+      : `${fmt(l.started)} done`;
+    if (l.failed) text += ` · ${fmt(l.failed)} failed`;
   }
   const prog = $("oProg");
   prog.textContent = text;
@@ -386,6 +397,7 @@ function render(s) {
   // Deliberately not the workflow id: several orders can be in flight at once,
   // so naming one of them misleads. The count is the honest version.
   const inFlight = s.orders_in_flight || 0;
+  lastInFlight = inFlight;
   $("wf").textContent = inFlight
     ? `${inFlight} order${inFlight === 1 ? "" : "s"} in flight`
     : "";
