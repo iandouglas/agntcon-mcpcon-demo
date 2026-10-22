@@ -274,12 +274,35 @@ function renderLauncher(l) {
   prog.title = text;          // the clamped version is unreadable on an error
 }
 
+// Placing and stopping orders need STAGE_ADMIN_TOKEN when the server has one.
+// Open the screen once as /?token=... and it is kept for the tab, then taken
+// out of the address bar so it is not on the projector.
+const adminToken = (() => {
+  const params = new URLSearchParams(location.search);
+  let token = params.get("token") || "";
+  try {
+    if (token) sessionStorage.setItem("stageToken", token);
+    else token = sessionStorage.getItem("stageToken") || "";
+  } catch (_) {}
+  if (params.has("token")) {
+    params.delete("token");
+    const qs = params.toString();
+    history.replaceState(null, "", location.pathname + (qs ? `?${qs}` : ""));
+  }
+  return token;
+})();
+
 async function post(url, body) {
+  const headers = { "content-type": "application/json" };
+  if (adminToken) headers.authorization = `Bearer ${adminToken}`;
   const res = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify(body || {}),
   });
+  if (res.status === 401) {
+    return { ok: false, status: 401, body: { error: "unauthorised: open this page with ?token=<STAGE_ADMIN_TOKEN>" } };
+  }
   return { ok: res.ok, status: res.status, body: await res.json().catch(() => ({})) };
 }
 

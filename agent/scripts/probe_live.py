@@ -3,6 +3,7 @@
 Use this to re-verify the integration after either side deploys, and right
 before the talk. It does a tools/list and one real tool call.
 
+    export MCP_ENDPOINT=https://<your-mcp-server>/mcp
     export MCP_AUTH_TOKEN=...
     uv run python scripts/probe_live.py
 """

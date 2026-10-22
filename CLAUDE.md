@@ -71,8 +71,8 @@ cd agent && set -a && source .env && set +a
 | Be the audience | `uv run python scripts/audience.py kill agent_worker` |
 | Local chaos run, scripted model | `uv run python scripts/e2e_chaos.py` |
 
-`MCP_ENDPOINT` defaults to Ian's live server. Point it at
-`http://localhost:8931/mcp` to use the local fake instead.
+`MCP_ENDPOINT` defaults to the local fake at `http://localhost:8931/mcp`. Set
+it to Ian's deployed server's `/mcp` URL to run against the real thing.
 
 ## The four protocol traps
 
