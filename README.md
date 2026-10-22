@@ -145,5 +145,9 @@ MCP server's tool names come from its own env vars.
 
 ## Design references
 
-- Ian's dev notes — https://github.com/iandouglas/temporal-agntcon-devnotes
+- Ian's dev notes and the Railway guide — https://github.com/iandouglas/temporal-agntcon-devnotes
 - `dejavu-tacos`, the pattern this borrows from — https://github.com/temporal-sa/demo-dejavu-tacos
+
+## License
+
+[MIT](LICENSE)
