@@ -35,6 +35,17 @@ FOREVER = RetryPolicy(
 HEARTBEAT_TIMEOUT = timedelta(seconds=5)
 
 
+def step_label(tool_name: str) -> str:
+    """What the Temporal UI shows for a tool call: `order_taco` -> "order taco".
+
+    The activity type stays `call_richards_tool` for every call, so without a
+    summary the timeline is a column of identical names. The summary is
+    metadata only: it is not checked on replay, so changing it is safe for
+    orders already in flight.
+    """
+    return tool_name.replace("_", " ").strip()
+
+
 @workflow.defn
 class TacoOrderAgent:
     def __init__(self) -> None:
@@ -54,6 +65,7 @@ class TacoOrderAgent:
         self.state.step = "discovering tools"
         tools = await workflow.execute_activity(
             list_richards_tools,
+            summary="place order",
             start_to_close_timeout=timedelta(seconds=30),
             heartbeat_timeout=HEARTBEAT_TIMEOUT,
             retry_policy=FOREVER,
@@ -74,6 +86,7 @@ class TacoOrderAgent:
                     order_id=order.order_id,
                     turn=turn,
                 ),
+                summary=f"agent call {turn + 1}",
                 start_to_close_timeout=timedelta(seconds=120),
                 heartbeat_timeout=HEARTBEAT_TIMEOUT,
                 retry_policy=FOREVER,
@@ -144,6 +157,7 @@ class TacoOrderAgent:
             return await workflow.execute_activity(
                 call_richards_tool,
                 call,
+                summary=step_label(call.name),
                 # Has to clear Railway's 15-minute request ceiling, which sits
                 # above the MCP server's own 840s wait cap. A service the
                 # audience is holding down makes this call SLOW, not failed —
