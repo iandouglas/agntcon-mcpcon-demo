@@ -183,6 +183,7 @@ async def list_tools(endpoint: str, token: str, read_seconds: float = 30.0) -> l
             name=tool["name"],
             description=tool.get("description", ""),
             input_schema=tool.get("inputSchema") or {"type": "object", "properties": {}},
+            title=tool.get("title") or "",
         )
         for tool in tools
     ]

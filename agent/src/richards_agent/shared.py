@@ -28,6 +28,10 @@ class ToolSpec:
     name: str
     description: str
     input_schema: dict[str, Any]
+    # The human name from the server's `service_N_name` env var ("Order Taco").
+    # Labels the step in the Temporal UI. Defaults empty so histories recorded
+    # before the field existed still decode.
+    title: str = ""
 
 
 @dataclass

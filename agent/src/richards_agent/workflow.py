@@ -35,21 +35,11 @@ FOREVER = RetryPolicy(
 HEARTBEAT_TIMEOUT = timedelta(seconds=5)
 
 
-def step_label(tool_name: str) -> str:
-    """What the Temporal UI shows for a tool call: `order_taco` -> "order taco".
-
-    The activity type stays `call_richards_tool` for every call, so without a
-    summary the timeline is a column of identical names. The summary is
-    metadata only: it is not checked on replay, so changing it is safe for
-    orders already in flight.
-    """
-    return tool_name.replace("_", " ").strip()
-
-
 @workflow.defn
 class TacoOrderAgent:
     def __init__(self) -> None:
         self.state = AgentState()
+        self._labels: dict[str, str] = {}
 
     @workflow.query
     def status(self) -> AgentState:
@@ -71,6 +61,13 @@ class TacoOrderAgent:
             retry_policy=FOREVER,
         )
         self.state.tools_available = [t.name for t in tools]
+        # Every tool call is the same activity type, `call_richards_tool`, so
+        # the Temporal UI's timeline only says what happened if each one
+        # carries a summary. The label is the tool's title, which the MCP
+        # server takes from its `service_N_name` env var, so renaming a tool
+        # on Railway renames its step. A summary is metadata only and is not
+        # checked on replay, so changing it is safe for orders in flight.
+        self._labels = {t.name: t.title or t.name for t in tools}
 
         messages: list[dict] = [{"role": "user", "content": order.request}]
 
@@ -157,7 +154,7 @@ class TacoOrderAgent:
             return await workflow.execute_activity(
                 call_richards_tool,
                 call,
-                summary=step_label(call.name),
+                summary=self._labels.get(call.name, call.name),
                 # Has to clear Railway's 15-minute request ceiling, which sits
                 # above the MCP server's own 840s wait cap. A service the
                 # audience is holding down makes this call SLOW, not failed —

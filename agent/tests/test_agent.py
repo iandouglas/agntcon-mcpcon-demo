@@ -32,9 +32,9 @@ from richards_agent.workflow import TacoOrderAgent
 
 TOOLS = [
     ToolSpec("get_specials", "today's special", {"type": "object", "properties": {}}),
-    ToolSpec("order_a_taco", "place an order", {"type": "object", "properties": {}}),
+    ToolSpec("order_a_taco", "place an order", {"type": "object", "properties": {}}, "Order A Taco"),
     ToolSpec("order_more_inventory", "restock", {"type": "object", "properties": {}}),
-    ToolSpec("take_payment", "charge", {"type": "object", "properties": {}}),
+    ToolSpec("take_payment", "charge", {"type": "object", "properties": {}}, "Take Payment"),
 ]
 
 
@@ -145,12 +145,15 @@ async def test_happy_path_chains_tools():
 @pytest.mark.asyncio
 async def test_each_step_is_labelled_in_the_temporal_ui():
     """Every tool call is the same activity type, `call_richards_tool`, so the
-    UI's timeline only says what happened if each one carries a summary."""
+    UI's timeline only says what happened if each one carries a summary.
+
+    Tool labels are the server's titles, i.e. its `service_N_name` env vars.
+    A tool with no title falls back to its name rather than going unlabelled."""
     async with await WorkflowEnvironment.start_time_skipping() as env:
         harness = Harness(
             [
                 _turn([("t1", "order_a_taco"), ("t2", "order_a_taco")]),
-                _turn([("t3", "take_payment")]),
+                _turn([("t3", "take_payment"), ("t4", "get_specials")]),
                 _turn(text="done"),
             ]
         )
@@ -178,10 +181,11 @@ async def test_each_step_is_labelled_in_the_temporal_ui():
     assert labels == [
         "place order",
         "agent call 1",
-        "order a taco",
-        "order a taco",
+        "Order A Taco",
+        "Order A Taco",
         "agent call 2",
-        "take payment",
+        "Take Payment",
+        "get_specials",
         "agent call 3",
     ]
 
