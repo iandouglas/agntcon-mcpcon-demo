@@ -7,6 +7,7 @@ is the one that catches it.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -31,9 +32,9 @@ from richards_agent.workflow import TacoOrderAgent
 
 TOOLS = [
     ToolSpec("get_specials", "today's special", {"type": "object", "properties": {}}),
-    ToolSpec("order_a_taco", "place an order", {"type": "object", "properties": {}}),
+    ToolSpec("order_a_taco", "place an order", {"type": "object", "properties": {}}, "Order A Taco"),
     ToolSpec("order_more_inventory", "restock", {"type": "object", "properties": {}}),
-    ToolSpec("take_payment", "charge", {"type": "object", "properties": {}}),
+    ToolSpec("take_payment", "charge", {"type": "object", "properties": {}}, "Take Payment"),
 ]
 
 
@@ -139,6 +140,54 @@ async def test_happy_path_chains_tools():
     assert state.turns == 6
     assert state.tokens_spent == 900  # 6 turns x 150
     assert state.tools_available == [t.name for t in TOOLS]
+
+
+@pytest.mark.asyncio
+async def test_each_step_is_labelled_in_the_temporal_ui():
+    """Every tool call is the same activity type, `call_richards_tool`, so the
+    UI's timeline only says what happened if each one carries a summary.
+
+    Tool labels are the server's titles, i.e. its `service_N_name` env vars.
+    A tool with no title falls back to its name rather than going unlabelled."""
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        harness = Harness(
+            [
+                _turn([("t1", "order_a_taco"), ("t2", "order_a_taco")]),
+                _turn([("t3", "take_payment"), ("t4", "get_specials")]),
+                _turn(text="done"),
+            ]
+        )
+        task_queue = f"test-{uuid.uuid4()}"
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[TacoOrderAgent],
+            activities=harness.activities(),
+        ):
+            handle = await env.client.start_workflow(
+                TacoOrderAgent.run,
+                OrderRequest(order_id="o-labels", request="two tacos"),
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+            await handle.result()
+            history = await handle.fetch_history()
+
+    labels = [
+        json.loads(event.user_metadata.summary.data)
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert labels == [
+        "place order",
+        "agent call 1",
+        "Order A Taco",
+        "Order A Taco",
+        "agent call 2",
+        "Take Payment",
+        "get_specials",
+        "agent call 3",
+    ]
 
 
 @pytest.mark.asyncio

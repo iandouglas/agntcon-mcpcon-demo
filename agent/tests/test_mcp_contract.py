@@ -76,6 +76,9 @@ async def test_tools_are_discovered_not_hardcoded(base: str):
     assert all(t.input_schema.get("properties") == {} for t in tools)
     # Descriptions matter: the model picks tools from them.
     assert all(t.description for t in tools)
+    # Titles are the server's `service_N_name` env vars, and label each step in
+    # the Temporal UI. Dropping them sends every step back to the bare tool id.
+    assert {t.name: t.title for t in tools}["order_taco"] == "Order Taco"
 
 
 @pytest.mark.asyncio

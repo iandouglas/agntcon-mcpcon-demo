@@ -39,6 +39,7 @@ HEARTBEAT_TIMEOUT = timedelta(seconds=5)
 class TacoOrderAgent:
     def __init__(self) -> None:
         self.state = AgentState()
+        self._labels: dict[str, str] = {}
 
     @workflow.query
     def status(self) -> AgentState:
@@ -54,11 +55,19 @@ class TacoOrderAgent:
         self.state.step = "discovering tools"
         tools = await workflow.execute_activity(
             list_richards_tools,
+            summary="place order",
             start_to_close_timeout=timedelta(seconds=30),
             heartbeat_timeout=HEARTBEAT_TIMEOUT,
             retry_policy=FOREVER,
         )
         self.state.tools_available = [t.name for t in tools]
+        # Every tool call is the same activity type, `call_richards_tool`, so
+        # the Temporal UI's timeline only says what happened if each one
+        # carries a summary. The label is the tool's title, which the MCP
+        # server takes from its `service_N_name` env var, so renaming a tool
+        # on Railway renames its step. A summary is metadata only and is not
+        # checked on replay, so changing it is safe for orders in flight.
+        self._labels = {t.name: t.title or t.name for t in tools}
 
         messages: list[dict] = [{"role": "user", "content": order.request}]
 
@@ -74,6 +83,7 @@ class TacoOrderAgent:
                     order_id=order.order_id,
                     turn=turn,
                 ),
+                summary=f"agent call {turn + 1}",
                 start_to_close_timeout=timedelta(seconds=120),
                 heartbeat_timeout=HEARTBEAT_TIMEOUT,
                 retry_policy=FOREVER,
@@ -144,6 +154,7 @@ class TacoOrderAgent:
             return await workflow.execute_activity(
                 call_richards_tool,
                 call,
+                summary=self._labels.get(call.name, call.name),
                 # Has to clear Railway's 15-minute request ceiling, which sits
                 # above the MCP server's own 840s wait cap. A service the
                 # audience is holding down makes this call SLOW, not failed —
